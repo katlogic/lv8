@@ -100,27 +100,20 @@ int lv8_new_context(struct lua_State *L)
   lv8_context *ctx = (lv8_context*)lua_newuserdata(L, sizeof(*ctx));
 
   lua_pushvalue(L, CTXMT); // Associate obj mt.
-  lua_setmetatable(L, -1);
+  lua_setmetatable(L, -2);
 
   if (lua_gettop(L) == 1 || lua_isnil(L, 1)) { // No sandbox.
     Local<Context> c = Context::New(ISOLATE);
     ctx->context.Reset(ISOLATE, c);
-//    ctx->context->SetAlignedPointerInEmbedderData(0, (void*)L);
     ctx->object.Reset(ISOLATE, c->Global());
   } else { // Sandboxed scope, global object is interceptor.
     Local<Context> c = Context::New(ISOLATE, 0, PROXY->InstanceTemplate());
     ctx->context.Reset(ISOLATE, c);
-//    ctx->context->SetAlignedPointerInEmbedderData(0, (void*)L);
-    lv8_object *existing = persistent_lookup(L, 1);
-    if (!existing) { // Mapping does not exist yet, create new one.
-      persistent_add(L, 1, ctx);
-      Local<Object> gl = c->Global();
-      gl->SetAlignedPointerInInternalField(0, (void*)ctx);
-      ctx->object.Reset(ISOLATE, gl);
-      ctx->object.SetWeak(L, js_weak_callback);
-    } else {
-      memcpy(ctx, existing, sizeof(lv8_object));// Unsafe copy of Persistent.
-    }
+    persistent_add(L, 1, ctx);
+    Local<Object> gl = c->Global();
+    gl->SetAlignedPointerInInternalField(0, (void*)ctx);
+    ctx->object.Reset(ISOLATE, gl);
+    ctx->object.SetWeak(L, js_weak_callback);
   }
   return 1;
 }
@@ -192,7 +185,7 @@ static void convert_js2lua(lua_State *L, const Local<Value> &v)
     lv8_object *obj = (lv8_context*)lua_newuserdata(L, sizeof(*obj));
     obj->object.Reset(ISOLATE, v->ToObject());
     lua_pushvalue(L, OBJMT); // Associate obj mt.
-    lua_setmetatable(L, -1);
+    lua_setmetatable(L, -2);
   } else {
     assert("Conversion failed" && 0);
   }
