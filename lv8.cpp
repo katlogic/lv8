@@ -21,7 +21,11 @@
  * THE SOFTWARE.
  */
 
+#ifndef NDEBUG
+#include <v8-debug.h>
+#else
 #include <v8.h>
+#endif
 #include <assert.h>
 #include <string.h>
 
@@ -29,10 +33,16 @@
 #include "lv8.hpp"
 
 using namespace v8;
+/* Optional performance hacks. */
+#define LV8_CACHE_PERSISTENT 1 // Set to 0 if this turns out slow.
 
-/* This may or may not make things faster. */
-#define LV8_CACHE_PERSISTENT 1
+/* lua_pushuserdata() is needed for Persistent<> caching. */
+#if LV8_CACHE_PERSISTENT
 #define LV8_IDENTITY "lv8::identity"
+#ifndef lua_pushuserdata
+#include "pudata.h"
+#endif
+#endif
 
 /* Shortcut macros. */
 #define STATEUD lua_upvalueindex(1)
@@ -44,10 +54,9 @@ using namespace v8;
 #define PROXY Local<FunctionTemplate>::New(ISOLATE, V8_STATE->proxy)
 #define LOCAL(v) Local<Value>::New(ISOLATE, (v))
 #define OREF(v) Local<Object>::New(ISOLATE, (v->object))
+#define REF(t,v) Local<t>::New(ISOLATE, (v))
 #define ESCAPE(v) scope.Escape(LOCAL(v));
 #define NEWSTR(arg...) String::NewFromUtf8(ISOLATE, arg)
-#define UNWRAP_L \
-  lua_State *L = (lua_State*)External::Cast(*info.Data())->Value()
 
 /*
  * Notes on how GC works:
@@ -105,17 +114,17 @@ static void persistent_add(lua_State *L, int idx, lv8_object *v)
 static int lv8_obj_gc(lua_State *L)
 {
   lv8_context *o = (lv8_context*)lua_touserdata(L, 1);
+  assert(o);
   lua_getmetatable(L, 1);
+  assert(!lua_isnil(L, -1));
   if (lua_rawequal(L, -1, CTXMT)) {
     o->context.Reset(); // Kill context if it is one.
-  } else {
-    HandleScope scope(ISOLATE);
-    assert(lua_rawequal(L, -1, OBJMT));
+  } else assert(lua_rawequal(L, -1, OBJMT));
 #if LV8_CACHE_PERSISTENT
-    OREF(o)->SetHiddenValue(NEWSTR(LV8_IDENTITY),
-        Undefined(ISOLATE));
+  HandleScope scope(ISOLATE);
+  OREF(o)->SetHiddenValue(NEWSTR(LV8_IDENTITY),
+      Undefined(ISOLATE));
 #endif
-  }
   o->object.Reset();
   return 0;
 }
@@ -131,10 +140,12 @@ js_weak_callback(const WeakCallbackData<v8::Object, lua_State> &data)
 
   persistent_lookup_js(L, (lv8_object*)v); // Lookup Lua object.
 
+#ifndef NDEBUG
   lua_getmetatable(L, -1); // These should always short-circuit long before.
   assert(!(lua_rawequal(L, -1, OBJMT) || lua_rawequal(L, -1, CTXMT)));
-
   lua_pop(L, 1);
+#endif
+
   lua_pushnil(L);
   lua_rawset(L, REFTAB); // Clear Lua -> JS.
   lua_pushlightuserdata(L, (void*)v);
@@ -149,6 +160,7 @@ int lv8_new_context(struct lua_State *L)
 {
   HandleScope scope(ISOLATE);
   lv8_context *ctx = (lv8_context*)lua_newuserdata(L, sizeof(*ctx));
+  memset(ctx, 0, sizeof(*ctx));
 
   lua_pushvalue(L, CTXMT); // Associate obj mt.
   lua_setmetatable(L, -2);
@@ -198,9 +210,10 @@ static Handle<Value> convert_lua2js(lua_State *L, int idx)
   if (!wrapper) { // Mapping does not exist yet.
     wrapper = (lv8_object*)lua_newuserdata(L, sizeof(lv8_object));
     if (!wrapper) return ESCAPE(Undefined(ISOLATE));
+    memset(wrapper, 0, sizeof(*wrapper));
     Local<Object> no = PROXY->InstanceTemplate()->NewInstance();
     wrapper->object.Reset(ISOLATE, no); // Anchor to persistent wrapper.
-    persistent_add(L, 1, wrapper); // Wrap Lua object at stack index 1.
+    persistent_add(L, idx, wrapper); // Wrap Lua object at stack index 1.
     no->SetAlignedPointerInInternalField(0, (void*)wrapper);
     wrapper->object.SetWeak(L, js_weak_callback);
   }
@@ -237,14 +250,15 @@ static void convert_js2lua(lua_State *L, const Local<Value> &v)
      * import a js object.
      *
      * To alleviate this, we inject a hidden property into JS objects which
-     * will actually tell us the lv8_object involved. Whether this will do
-     * us any good remains to be seen.
+     * directly link to relevant userdata. This is done only if using
+     * extended Lua dialect which allows lua_pushuserdata. Double-wrapping
+     * overhead to make it work in standard would kill benefits of this hack
+     * in the first place.
      */
     Local<String> idstr = NEWSTR(LV8_IDENTITY);
     Local<Value> identity = o->GetHiddenValue(idstr);
     if (!identity.IsEmpty()) {
-      persistent_lookup_js(L, (lv8_object*)External::Cast(*identity)->Value());
-      assert(!lua_isnil(L, -1));
+      lua_pushuserdata(L, External::Cast(*identity)->Value());
       return; // Already wrapped JS object.
     }
     lv8_object *obj = (lv8_object*)lua_newuserdata(L, sizeof(*obj));
@@ -252,32 +266,40 @@ static void convert_js2lua(lua_State *L, const Local<Value> &v)
 #else
     lv8_object *obj = (lv8_object*)lua_newuserdata(L, sizeof(*obj));
 #endif
+    memset(obj, 0, sizeof(*obj));
     obj->object.Reset(ISOLATE, o); // Anchor until lv8_obj_gc kills it.
     lua_pushvalue(L, OBJMT); // Associate obj mt.
     lua_setmetatable(L, -2);
   }
 }
 
+/* Common context header. */
+#define CB_LUA_COMMON \
+  HandleScope scope(ISOLATE); \
+  lv8_object *p = (lv8_object*)lua_touserdata(L, 1); \
+  Local<Object> o = OREF(p); \
+  Local<Context> ctx = o->CreationContext(); \
+  ctx->Enter();
+
 /* Call from Lua to JS. */
 static int lv8_lua2js_call(lua_State *L)
 {
   int caught = 0;
-  lv8_object *o = (lv8_object*)lua_touserdata(L, 1);
   {
+    CB_LUA_COMMON; // Enter context.
     int argc = lua_gettop(L);
-    HandleScope scope(ISOLATE); // To kill locals below.
     Local<Value> argv[argc];
 
     for (int i = 0; i < argc; i++) // Convert argv.
       argv[i] = convert_lua2js(L, i+1);
 
     TryCatch exc; // CAVEAT: Must be destroyed before longjmp.
-    Local<Object> self = Local<Object>::New(ISOLATE, o->object);
-    Local<Value> res = self->CallAsFunction(self, argc, argv);
+    Local<Value> res = o->CallAsFunction(o, argc, argv);
     if (exc.HasCaught()) {
       convert_js2lua(L, exc.Exception());
       caught = 1;
     } else convert_js2lua(L, res); // Otherwise convert result.
+    ctx->Exit(); // Leave context.
   }
   if (caught)
     lua_error(L); // longjmp() is safe at this point.
@@ -287,19 +309,60 @@ static int lv8_lua2js_call(lua_State *L)
 /* Get JS object property. */
 static int lv8_obj_index(lua_State *L)
 {
-  HandleScope scope(ISOLATE);
-  lv8_object *o = (lv8_object*)lua_touserdata(L, 1);
-  convert_js2lua(L, OREF(o)->Get(convert_lua2js(L, 2)));
+  CB_LUA_COMMON;
+  convert_js2lua(L, o->Get(convert_lua2js(L, 2)));
+  ctx->Exit();
   return 1;
 }
 
 /* Set JS object property. */
 static int lv8_obj_newindex(lua_State *L)
 {
-  HandleScope scope(ISOLATE);
-  lv8_object *o = (lv8_object*)lua_touserdata(L, 1);
-  OREF(o)->Set(convert_lua2js(L, 2), convert_lua2js(L, 3));
+  CB_LUA_COMMON;
+  o->Set(convert_lua2js(L, 2), convert_lua2js(L, 3));
+  ctx->Exit();
   return 0;
+}
+
+/* (Very) coarse stringify. */
+static const char *stringify(const Handle<Value> &v)
+{
+#define TSTR(n) if (v->Is##n()) { return #n; } else
+  TSTR(TypedArray)
+  TSTR(Array)
+  TSTR(Date)
+  TSTR(RegExp)
+  TSTR(Function)
+  TSTR(Symbol)
+  TSTR(External)
+  { return "Unknown"; };
+#undef TSTR
+}
+
+/* Produce human readable for of Lua objects. */
+static int lv8_obj_tostring(lua_State *L)
+{
+  HandleScope scope(ISOLATE);
+  lv8_context *o = (lv8_context*)lua_touserdata(L, 1);
+  Handle<Object> v = OREF(o);
+  lua_getmetatable(L, 1);
+  assert(!lua_isnil(L, -1));
+  if (lua_rawequal(L, -1, CTXMT)) {
+    if (PROXY->HasInstance(v)) { // Sandbox.
+      persistent_lookup_js(L, o);
+      assert(!lua_isnil(L,-1));
+      lua_pushfstring(L, "js:sandbox:[(lv8_context *)%p = { %p, %s }]",
+          o, *REF(Context,o->context), luaL_tolstring(L, -1, 0));
+      return 1;
+    } else {
+      lua_pushfstring(L, "js:context:[(lv8_context *)%p = { %p, %p }]",
+          o, *REF(Context,o->context), *v);
+      return 1;
+    }
+  }
+  lua_pushfstring(L, "js:object:%s:[(lv8_object *)%p = { %p }]",
+      stringify(v), o, *v);
+  return 1;
 }
 
 /* Protected settable. */
@@ -340,6 +403,10 @@ static bool exception(lua_State *L, int narg, int nret)
   lua_pop(L, 1);
   return true;
 }
+
+/* Load L callback argument. */
+#define UNWRAP_L \
+  lua_State *L = (lua_State*)External::Cast(*info.Data())->Value()
 
 /* Get holder[idx]. */
 static void lv8_getidx_cb(uint32_t idx,
@@ -485,11 +552,12 @@ static const struct luaL_Reg lv8_object_mt[] = {
   { "__newindex", lv8_obj_newindex },
   { "__call",     lv8_lua2js_call},
   { "__gc",       lv8_obj_gc },
+  { "__tostring", lv8_obj_tostring },
   { 0, 0 }
 };
 
 /* Discard remaining v8 state after Lua side is closed. */
-static int luaclose_v8(lua_State *L)
+int luaclose_lv8(lua_State *L)
 {
   lv8_state *state = (lv8_state*)lua_touserdata(L, 1);
   state->proxy.Reset(); // Should have no refs.
@@ -508,10 +576,14 @@ int luaopen_lv8(lua_State *L)
     lua_pop(L, 1);
   }
 
+  lua_settop(L, 0);
+
   /* Upvalue #1: globally shared state which holds our proxy template. */
   lv8_state *state = (lv8_state*) lua_newuserdata(L, sizeof(lv8_state));
+  memset(state, 0, sizeof(*state));
   Local<FunctionTemplate> proxy =
-    FunctionTemplate::New(ISOLATE, lv8_js2lua_call, External::New(ISOLATE, L));
+    FunctionTemplate::New(ISOLATE);
+//, lv8_js2lua_call, External::New(ISOLATE, L)
   state->proxy.Reset(ISOLATE, proxy);
   Handle<ObjectTemplate> tpl = proxy->InstanceTemplate();
   tpl->SetInternalFieldCount(1); // Points to wrapped lua object.
@@ -524,7 +596,7 @@ int luaopen_lv8(lua_State *L)
       lv8_delidx_cb, lv8_enumidx_cb,
       External::New(ISOLATE, L));
   lua_newtable(L); // State cleanup mt.
-  lua_pushcfunction(L, luaclose_v8);
+  lua_pushcfunction(L, luaclose_lv8);
   lua_setfield(L, -2, "__gc");
   lua_setmetatable(L, -2);
 

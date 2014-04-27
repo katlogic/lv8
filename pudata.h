@@ -1,5 +1,5 @@
 /*
- * Lua <-> V8 bridge
+ * lua_pushuserdata() polyfill (slow).
  * (C) Copyright 2014, Karel Tuma <kat@lua.cz>, All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -21,19 +21,39 @@
  * THE SOFTWARE.
  */
 
-/* This header is exclusively for C users who are not interested in
- * poking V8 guts (eg. only static linking this library).
- * For C++ you may want to use lv8.hpp */
-#ifndef LV8_EXTERN
-#define LV8_EXTERN
+#ifndef lua_pushuserdata
+#define PUDATA_RIDX "__pudata_field"
+
+/* Resolve actual userdata. */
+static void lua_pushuserdata_portable(lua_State *L, void *p)
+{
+  luaL_getmetatable(L, PUDATA_RIDX);
+  lua_pushlightuserdata(L, p);
+  lua_rawget(L, -2);
+  lua_replace(L, -2);
+}
+
+/* For this to work; we have to wrap lua_newuserdata. */
+static void *lua_newuserdata_wrapper(lua_State *L, size_t sz)
+{
+  void *p = lua_newuserdata(L, sz);
+  luaL_getmetatable(L, PUDATA_RIDX);
+  if (lua_isnil(L, -1)) { /* Create if missing. */
+    lua_pop(L, 1);
+    luaL_newmetatable(L, PUDATA_RIDX);
+    lua_pushvalue(L, -1);
+    lua_setmetatable(L, -2); /* Point to self. */
+    lua_pushliteral(L, "v");
+    lua_setfield(L, -2, "__mode"); /* Weak values (udata). */
+  }
+  lua_pushlightuserdata(L, p); /* Key. */
+  lua_pushvalue(L, -3); /* Value. */
+  lua_rawset(L, -3); /* Associate. */
+  lua_pop(L, 1); /* Pop metatable. */
+  return p;
+}
+
+#define lua_pushuserdata(L, p) lua_pushuserdata_portable(L, p)
+#define lua_newuserdata(L, sz) lua_newuserdata_wrapper(L, sz)
 #endif
-
-#include <lua.h>
-#include <lauxlib.h>
-
-LV8_EXTERN int luaopen_lv8(lua_State *L);
-LV8_EXTERN int luaclose_lv8(lua_State *L);
-LV8_EXTERN int lv8_new_context(lua_State *L);
-
-#undef LV8_EXTERN
 

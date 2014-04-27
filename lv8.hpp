@@ -34,7 +34,6 @@ struct lv8_object {
 
 struct lv8_context : lv8_object {
   v8::Persistent<v8::Context> context;
-  lua_State *L;
 };
 
 struct lv8_state {
