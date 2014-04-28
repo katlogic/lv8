@@ -324,22 +324,7 @@ static int lv8_obj_newindex(lua_State *L)
   return 0;
 }
 
-/* (Very) coarse stringify. */
-static const char *stringify(const Handle<Value> &v)
-{
-#define TSTR(n) if (v->Is##n()) { return #n; } else
-  TSTR(TypedArray)
-  TSTR(Array)
-  TSTR(Date)
-  TSTR(RegExp)
-  TSTR(Function)
-  TSTR(Symbol)
-  TSTR(External)
-  { return "Unknown"; };
-#undef TSTR
-}
-
-/* Produce human readable for of Lua objects. */
+/* Print constructor name of js objects. */
 static int lv8_obj_tostring(lua_State *L)
 {
   HandleScope scope(ISOLATE);
@@ -351,17 +336,14 @@ static int lv8_obj_tostring(lua_State *L)
     if (PROXY->HasInstance(v)) { // Sandbox.
       persistent_lookup_js(L, o);
       assert(!lua_isnil(L,-1));
-      lua_pushfstring(L, "js:sandbox:[(lv8_context *)%p = { %p, %s }]",
-          o, *REF(Context,o->context), luaL_tolstring(L, -1, 0));
-      return 1;
+      lua_pushfstring(L,"js<*sandbox>: %p", *v);
     } else {
-      lua_pushfstring(L, "js:context:[(lv8_context *)%p = { %p, %p }]",
-          o, *REF(Context,o->context), *v);
-      return 1;
+      lua_pushfstring(L,"js<*context>: %p", *v);
     }
+    return 1;
   }
-  lua_pushfstring(L, "js:object:%s:[(lv8_object *)%p = { %p }]",
-      stringify(v), o, *v);
+  lua_pushfstring(L, "js<%s>: %p",
+        *String::Utf8Value(v->GetConstructorName()), *v);
   return 1;
 }
 
