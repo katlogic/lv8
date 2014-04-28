@@ -40,7 +40,7 @@ using namespace v8;
 #if LV8_CACHE_PERSISTENT
 #define LV8_IDENTITY "lv8::identity"
 #ifndef lua_pushuserdata
-#include "pudata.h"
+#include "pudata/pudata.h"
 #endif
 #endif
 

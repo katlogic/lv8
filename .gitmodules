@@ -1,0 +1,3 @@
+[submodule "pudata"]
+	path = pudata
+	url = https://github.com/katlogic/pudata
