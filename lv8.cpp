@@ -182,7 +182,7 @@ int lv8_new_context(struct lua_State *L)
 }
 
 /* Convert Lua value to JS counterpart. */
-static Handle<Value> convert_lua2js(lua_State *L, int idx)
+static Local<Value> convert_lua2js(lua_State *L, int idx)
 {
   EscapableHandleScope scope(ISOLATE);
   switch (lua_type(L, idx)) { // Base types.
@@ -605,15 +605,16 @@ static void lv8_js2lua_call(const v8::FunctionCallbackInfo<Value> &info)
     return; // Propagate exception.
   }
 
+
   int nres = lua_gettop(L) - top; // Convert output results.
   if (!nres) { // No results.
     info.GetReturnValue().Set(Undefined(ISOLATE));
   } if (nres == 1) { // Single result.
     info.GetReturnValue().Set(convert_lua2js(L, -1));
   } else { // Multiple results will go into array.
-    Handle<Array> array = Array::New(ISOLATE, 3);
-    for (int i = 0; i < nres; i++)
-      array->Set(i, convert_lua2js(L, top + i));
+    Local<Array> array = Array::New(ISOLATE, nres);
+    for (uint32_t i = 0; i < nres; i++)
+      array->Set(i, convert_lua2js(L, top + i + 1));
     info.GetReturnValue().Set(array);
   }
   lua_pop(L, nres);
