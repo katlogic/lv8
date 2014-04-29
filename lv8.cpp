@@ -282,27 +282,32 @@ static void convert_js2lua(lua_State *L, const Local<Value> &v)
   ctx->Enter();
 
 /* Call from Lua to JS. */
-static int lv8_lua2js_call(lua_State *L)
+static int lv8_obj_lua2js_call(lua_State *L)
 {
   int caught = 0;
   {
     CB_LUA_COMMON; // Enter context.
-    int argc = lua_gettop(L);
+    int argc = lua_gettop(L)-1;
     Local<Value> argv[argc];
 
     for (int i = 0; i < argc; i++) // Convert argv.
-      argv[i] = convert_lua2js(L, i+1);
+      argv[i] = convert_lua2js(L, i+2);
 
     TryCatch exc; // CAVEAT: Must be destroyed before longjmp.
     Local<Value> res = o->CallAsFunction(o, argc, argv);
     if (exc.HasCaught()) {
-      convert_js2lua(L, exc.Exception());
+      Local<Object> eo = exc.Exception()->ToObject();
+      luaL_traceback(L, L, *String::Utf8Value(eo->Get(NEWSTR("stack"))), 1);
+      eo->Set(NEWSTR("traceback"), convert_lua2js(L, -1));
+      lua_pop(L, 1);
+      convert_js2lua(L, eo);
       caught = 1;
     } else convert_js2lua(L, res); // Otherwise convert result.
     ctx->Exit(); // Leave context.
   }
-  if (caught)
-    lua_error(L); // longjmp() is safe at this point.
+  if (caught) {
+    lua_error(L); // Error object already on stack.
+  }
   return 1;
 }
 
@@ -327,23 +332,108 @@ static int lv8_obj_newindex(lua_State *L)
 /* Print constructor name of js objects. */
 static int lv8_obj_tostring(lua_State *L)
 {
-  HandleScope scope(ISOLATE);
-  lv8_context *o = (lv8_context*)lua_touserdata(L, 1);
-  Handle<Object> v = OREF(o);
+  CB_LUA_COMMON;
   lua_getmetatable(L, 1);
   assert(!lua_isnil(L, -1));
   if (lua_rawequal(L, -1, CTXMT)) {
-    if (PROXY->HasInstance(v)) { // Sandbox.
-      persistent_lookup_js(L, o);
+    if (PROXY->HasInstance(o)) { // Sandbox.
+      persistent_lookup_js(L, p);
       assert(!lua_isnil(L,-1));
-      lua_pushfstring(L,"js<*sandbox>: %p", *v);
+      lua_pushfstring(L,"js<*sandbox>: %p", *o);
     } else {
-      lua_pushfstring(L,"js<*context>: %p", *v);
+      lua_pushfstring(L,"js<*context>: %p", *o);
     }
-    return 1;
+  }else {
+    if (o->IsNativeError()) {
+      Local<Object> tb = o->Get(NEWSTR("traceback"))->ToObject();
+      if (!tb.IsEmpty()) {
+        lua_pushfstring(L,*String::Utf8Value(tb));
+        ctx->Exit();
+        return 1;
+      }
+    }
+    lua_pushfstring(L, "js<%s>: %p",
+          *String::Utf8Value(o->GetConstructorName()), *o);
   }
-  lua_pushfstring(L, "js<%s>: %p",
-        *String::Utf8Value(v->GetConstructorName()), *v);
+  ctx->Exit();
+  return 1;
+}
+
+/* Array() ipairs iterator. */
+static int js_array_ipairs_aux(lua_State *L)
+{
+  CB_LUA_COMMON;
+  int nret = 0;
+  uint32_t idx = 0;
+  if (o->IsArray()) {
+    if (!lua_isnil(L, 2))
+      idx = lua_tonumber(L, 2)+1;
+    Local<Array> a = Local<Array>::Cast(o);
+    if (idx < a->Length()) {
+      lua_pushinteger(L, idx);
+      convert_js2lua(L, Local<Array>::Cast(o)->CloneElementAt(idx));
+      nret = 3;
+    }
+  }
+  ctx->Exit();
+  return nret;
+}
+
+/* Enumerate indexed properties of array instance. */
+static int lv8_obj_ipairs(lua_State *L)
+{
+  int err = 0;
+  {
+    CB_LUA_COMMON;
+    ctx->Exit();
+    if (!o->IsArray()) {
+      err = 1;
+    } else {
+      Array *a = Array::Cast(*o);
+      lua_pushcfunction(L, js_array_ipairs_aux);
+      lua_pushvalue(L, 1);
+      lua_pushnil(L);
+      return 3;
+    }
+  }
+  if (err)
+    luaL_error(L, "Only JS Array() can be used with ipairs()");
+}
+
+/* Just call next(). */
+static int js_object_pairs_aux(lua_State *L)
+{
+  lua_settop(L, 2);
+  if (lua_next(L, 1))
+    return 2;
+  return 0;
+}
+
+/* Enumerate everything in given object. */
+static int lv8_obj_pairs(lua_State *L)
+{
+  CB_LUA_COMMON;
+  Local<Array> a = o->GetOwnPropertyNames();
+  uint32_t n = a->Length();
+  lua_pushcfunction(L, js_object_pairs_aux);
+  lua_newtable(L); // Table t.
+  for (uint32_t i = 0; i < n; i++) {
+    Local<Value> propname = Local<Array>::Cast(o)->CloneElementAt(i);
+    convert_js2lua(L, propname); // Key.
+    convert_js2lua(L, o->Get(propname)); // Val.
+    lua_rawset(L, -3); // Set t[key] = val.
+  }
+  lua_pushnil(L); // Start index for next().
+  ctx->Exit();
+  return 3;
+}
+
+/* Get length of JS object. */
+static int lv8_obj_len(lua_State *L)
+{
+  CB_LUA_COMMON;
+  convert_js2lua(L, o->Get(NEWSTR("length")));
+  ctx->Exit();
   return 1;
 }
 
@@ -532,9 +622,12 @@ static void lv8_js2lua_call(const v8::FunctionCallbackInfo<Value> &info)
 static const struct luaL_Reg lv8_object_mt[] = {
   { "__index",    lv8_obj_index },
   { "__newindex", lv8_obj_newindex },
-  { "__call",     lv8_lua2js_call},
+  { "__call",     lv8_obj_lua2js_call},
   { "__gc",       lv8_obj_gc },
   { "__tostring", lv8_obj_tostring },
+  { "__pairs",    lv8_obj_pairs },
+  { "__ipairs",   lv8_obj_ipairs },
+  { "__len",      lv8_obj_len },
   { 0, 0 }
 };
 
@@ -560,12 +653,11 @@ int luaopen_lv8(lua_State *L)
 
   lua_settop(L, 0);
 
-  /* Upvalue #1: globally shared state which holds our proxy template. */
+  /* Globally shared state which holds our proxy template. */
   lv8_state *state = (lv8_state*) lua_newuserdata(L, sizeof(lv8_state));
   memset(state, 0, sizeof(*state));
   Local<FunctionTemplate> proxy =
     FunctionTemplate::New(ISOLATE);
-//, lv8_js2lua_call, External::New(ISOLATE, L)
   state->proxy.Reset(ISOLATE, proxy);
   Handle<ObjectTemplate> tpl = proxy->InstanceTemplate();
   tpl->SetInternalFieldCount(1); // Points to wrapped lua object.
@@ -577,33 +669,25 @@ int luaopen_lv8(lua_State *L)
       lv8_getidx_cb, lv8_setidx_cb, 0,
       lv8_delidx_cb, lv8_enumidx_cb,
       External::New(ISOLATE, L));
+  tpl->SetCallAsFunctionHandler(lv8_js2lua_call, External::New(ISOLATE, L));
   lua_newtable(L); // State cleanup mt.
   lua_pushcfunction(L, luaclose_lv8);
   lua_setfield(L, -2, "__gc");
   lua_setmetatable(L, -2);
 
-  /* Upvalue #2: Translation table of lv8_object <-> Lua object. */
-  lua_newtable(L);
+  /* Set up UV #2-#4. */
+  for (int i = 0; i < 3; i++)
+    lua_newtable(L);
 
-  /* Upvalue #3: Metatable for V8 objects. */
-  lua_newtable(L);
-
-  /* Upvalue #4: Metatable for V8 contexes. */
-  lua_newtable(L);
-
-  /* For #4 */
-  lua_pushvalue(L, 1);
-  lua_pushvalue(L, 2);
-  lua_pushvalue(L, 3);
-  lua_pushvalue(L, 4);
+  /* Set funcs for UV #4 */
+  for (int i = 1; i <= 4; i++)
+    lua_pushvalue(L, i);
   luaL_setfuncs(L, lv8_object_mt, 4);
 
-  /* For #3 */
+  /* Set funcs for UV #3 */
   lua_pushvalue(L, 3);
-  lua_pushvalue(L, 1);
-  lua_pushvalue(L, 2);
-  lua_pushvalue(L, 3);
-  lua_pushvalue(L, 4);
+  for (int i = 1; i <= 4; i++)
+    lua_pushvalue(L, i);
   luaL_setfuncs(L, lv8_object_mt, 4);
   lua_pop(L, 1); // Pop #3.
 
