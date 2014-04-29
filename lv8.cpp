@@ -227,15 +227,16 @@ static void convert_js2lua(lua_State *L, const Local<Value> &v)
   HandleScope scope(ISOLATE);
   if (v.IsEmpty() || v->IsUndefined() || v->IsNull()) {
     lua_pushnil(L);
-  } if (v->IsBoolean()) {
+  } else if (v->IsBoolean() || v->IsBooleanObject()) {
     lua_pushboolean(L, v->BooleanValue());
-  } else if (v->IsNumber()) {
+  } else if (v->IsNumber() || v->IsNumberObject()) {
     lua_pushnumber(L, v->NumberValue());
-  } else if (v->IsString()) {
+  } else if (v->IsString() || v->IsStringObject()) {
     String::Utf8Value str(v);
     lua_pushlstring(L, *str, str.length());
-  } else { // Must be some sort of object.
+  } else { // Must be some sort of other object.
     Local<Object> o = v->ToObject();
+
     if (PROXY->HasInstance(v)) { // Possibly wrapped Lua.
       persistent_lookup_js(L, (lv8_object*)
           o->GetAlignedPointerFromInternalField(0));
@@ -413,10 +414,10 @@ static int js_object_pairs_aux(lua_State *L)
 static int lv8_obj_pairs(lua_State *L)
 {
   CB_LUA_COMMON;
-  Local<Array> a = o->GetOwnPropertyNames();
+  Local<Array> a = o->GetPropertyNames();
   uint32_t n = a->Length();
   lua_pushcfunction(L, js_object_pairs_aux);
-  lua_newtable(L); // Table t.
+  lua_createtable(L, n, 2); // Table t.
   for (uint32_t i = 0; i < n; i++) {
     Local<Value> propname = a->Get(i);
     if (propname.IsEmpty())
@@ -455,8 +456,8 @@ static void settab(lua_State *L)
 /* Protected gettable. */
 static int gettab_aux(lua_State *L)
 {
-  lua_gettable(L, -3);
-  return 0;
+  lua_gettable(L, -2);
+  return 1;
 }
 
 /* Prepare protected v = t[k] call. */
@@ -471,10 +472,11 @@ static void gettab(lua_State *L)
  */
 static bool exception(lua_State *L, int narg, int nret)
 {
-  if (lua_pcall(L, narg, nret, 0) == LUA_OK)
+  if (lua_pcall(L, narg, nret, 0) == LUA_OK) {
     return false;
-  ISOLATE->ThrowException(convert_lua2js(L, -1));
-  lua_pop(L, 1);
+  }
+  ISOLATE->ThrowException(Exception::Error(NEWSTR(lua_tostring(L, -1))));
+  lua_pop(L, 1); // Pop error message.
   return true;
 }
 
@@ -538,10 +540,8 @@ static void lv8_getprop_cb(Local<String> prop,
   gettab(L);
   convert_js2lua(L, info.Holder());
   convert_js2lua(L, prop);
-  if (exception(L, 2, 1)) {
-    info.GetReturnValue().Set(Undefined(ISOLATE));
+  if (exception(L, 2, 1))
     return;
-  }
   info.GetReturnValue().Set(convert_lua2js(L, -1));
   lua_pop(L, -1);
 }
@@ -555,10 +555,8 @@ static void lv8_setprop_cb(Local<String> prop, Local<Value> val,
   convert_js2lua(L, info.Holder());
   convert_js2lua(L, prop);
   convert_js2lua(L, val);
-  if (exception(L, 3, 0)) {
+  if (exception(L, 3, 0))
     info.GetReturnValue().Set(Undefined(ISOLATE));
-    return;
-  }
 }
 
 /* Set holder.prop = nil. */
@@ -570,28 +568,48 @@ static void lv8_delprop_cb(Local<String> prop,
   convert_js2lua(L, info.Holder());
   convert_js2lua(L, prop);
   lua_pushnil(L);
-  if (exception(L, 3, 0)) {
+  if (exception(L, 3, 0))
     info.GetReturnValue().Set(Boolean::New(ISOLATE,false));
-    return;
-  }
   info.GetReturnValue().Set(Boolean::New(ISOLATE, true));
 }
 
+/* Enumerate both array and hash. */
 static void lv8_enumprop_cb(const PropertyCallbackInfo<Array> &info)
 {
+  HandleScope scope(ISOLATE);
+  UNWRAP_L;
+  convert_js2lua(L, info.Holder()); // Load table
+  if (!lua_istable(L, -1)) {
+    lua_pop(L, 1);
+    ISOLATE->ThrowException(NEWSTR("Only lua tables can be enumerated"));
+  }
+  uint32_t i, n = 0; // Slower: lua_rawlen(L -1);
+  Local<Array> a = Array::New(ISOLATE, n);
+  i = 0;
+  lua_pushnil(L); // First key.
+  for (i = 0; lua_next(L, -2); i++) {
+    if (i == n) // Filled guessed size? Expand the array.
+      a->Set(NEWSTR("length"), Integer::New(ISOLATE, n += 8));
+    a->Set(i, convert_lua2js(L, -2)); // Set key.
+    lua_pop(L, 1); // Pop value.
+  }
+  lua_pop(L, 1); // Pop table.
+  a->Set(NEWSTR("length"), Integer::New(ISOLATE, i));
+  info.GetReturnValue().Set(a);
 }
 
 static void lv8_enumidx_cb(const PropertyCallbackInfo<Array> &info)
 {
+  // UB: This works since above we enum integer keys as well.
+  info.GetReturnValue().Set(Array::New(ISOLATE));
 }
-
 
 /* Calls from JS to Lua. 'v8::' Because of namespace clash. */
 static void lv8_js2lua_call(const v8::FunctionCallbackInfo<Value> &info)
 {
   HandleScope scope(ISOLATE); // To kill locals below.
   UNWRAP_L;
-  Handle<Object> self = info.Holder();
+  Handle<Object> self = info.This();
   int argc = info.Length();
   int top = lua_gettop(L);
 
