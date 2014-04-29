@@ -225,12 +225,12 @@ out:;
 static void convert_js2lua(lua_State *L, const Local<Value> &v)
 {
   HandleScope scope(ISOLATE);
-  if (v->IsBoolean()) {
+  if (v.IsEmpty() || v->IsUndefined() || v->IsNull()) {
+    lua_pushnil(L);
+  } if (v->IsBoolean()) {
     lua_pushboolean(L, v->BooleanValue());
   } else if (v->IsNumber()) {
     lua_pushnumber(L, v->NumberValue());
-  } else if (v->IsUndefined() || v->IsNull()) {
-    lua_pushnil(L);
   } else if (v->IsString()) {
     String::Utf8Value str(v);
     lua_pushlstring(L, *str, str.length());
@@ -371,8 +371,8 @@ static int js_array_ipairs_aux(lua_State *L)
     Local<Array> a = Local<Array>::Cast(o);
     if (idx < a->Length()) {
       lua_pushinteger(L, idx);
-      convert_js2lua(L, Local<Array>::Cast(o)->CloneElementAt(idx));
-      nret = 3;
+      convert_js2lua(L, a->Get(idx));
+      nret = 2;
     }
   }
   ctx->Exit();
@@ -389,7 +389,7 @@ static int lv8_obj_ipairs(lua_State *L)
     if (!o->IsArray()) {
       err = 1;
     } else {
-      Array *a = Array::Cast(*o);
+      Local<Array> a = Local<Array>::Cast(o);
       lua_pushcfunction(L, js_array_ipairs_aux);
       lua_pushvalue(L, 1);
       lua_pushnil(L);
@@ -418,7 +418,9 @@ static int lv8_obj_pairs(lua_State *L)
   lua_pushcfunction(L, js_object_pairs_aux);
   lua_newtable(L); // Table t.
   for (uint32_t i = 0; i < n; i++) {
-    Local<Value> propname = Local<Array>::Cast(o)->CloneElementAt(i);
+    Local<Value> propname = a->Get(i);
+    if (propname.IsEmpty())
+      continue;
     convert_js2lua(L, propname); // Key.
     convert_js2lua(L, o->Get(propname)); // Val.
     lua_rawset(L, -3); // Set t[key] = val.
@@ -604,7 +606,6 @@ static void lv8_js2lua_call(const v8::FunctionCallbackInfo<Value> &info)
     info.GetReturnValue().Set(Boolean::New(ISOLATE, false));
     return; // Propagate exception.
   }
-
 
   int nres = lua_gettop(L) - top; // Convert output results.
   if (!nres) { // No results.
