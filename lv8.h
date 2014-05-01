@@ -33,7 +33,9 @@
 
 LV8_EXTERN int luaopen_lv8(lua_State *L);
 LV8_EXTERN int luaclose_lv8(lua_State *L);
-LV8_EXTERN int lv8_new_context(lua_State *L);
+LV8_EXTERN int lv8_create_context(lua_State *L);
+LV8_EXTERN int lv8_create_sandbox(lua_State *L);
+LV8_EXTERN int lv8_create_instance(lua_State *L);
 
 #undef LV8_EXTERN
 
