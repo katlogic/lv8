@@ -303,7 +303,6 @@ int lv8_create_sandbox(struct lua_State *L)
   return 1;
 }
 
-
 /* Common context header. */
 #define CB_LUA_COMMON \
   HandleScope scope(ISOLATE); \
@@ -670,10 +669,6 @@ static void lv8_enumprop_cb(const PropertyCallbackInfo<Array> &info)
   info.GetReturnValue().Set(a);
 }
 
-static void lv8_enumidx_cb(const PropertyCallbackInfo<Array> &info)
-{
-}
-
 /* Calls from JS to Lua. 'v8::' Because of namespace clash. */
 static void lv8_js2lua_call(const v8::FunctionCallbackInfo<Value> &info)
 {
@@ -772,7 +767,7 @@ int luaopen_lv8(lua_State *L)
       External::New(ISOLATE, L));
   tpl->SetIndexedPropertyHandler( // Indexed properties.
       lv8_getidx_cb, lv8_setidx_cb, 0,
-      lv8_delidx_cb, lv8_enumidx_cb,
+      lv8_delidx_cb, 0,
       External::New(ISOLATE, L));
   tpl->SetCallAsFunctionHandler(lv8_js2lua_call, External::New(ISOLATE, L));
   lua_newtable(L); // State cleanup mt.
