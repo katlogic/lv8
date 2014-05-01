@@ -190,8 +190,8 @@ static Local<Value> convert_lua2js(lua_State *L, int idx)
     if (!wrapper) return ESCAPE(Undefined(ISOLATE));
     memset(wrapper, 0, sizeof(*wrapper));
     Local<Object> no = PROXY->InstanceTemplate()->NewInstance();
-    wrapper->object.Reset(ISOLATE, no); // Anchor to persistent wrapper.
-    persistent_add(L, idx, wrapper); // Wrap Lua object at stack index 1.
+    wrapper->object.Reset(ISOLATE, no); // Anchor proxy in JS
+    persistent_add(L, idx, wrapper); // Anchor Persistent<> UD in Lua
     no->SetAlignedPointerInInternalField(0, (void*)wrapper);
     wrapper->object.SetWeak(L, js_weak_callback);
     lua_pop(L, 1);
@@ -255,7 +255,6 @@ static void convert_js2lua(lua_State *L, const Local<Value> &v)
 /* Construct new JS context. */
 int lv8_create_context(struct lua_State *L)
 {
-  int pos = 1;
   HandleScope scope(ISOLATE);
   lv8_context *ctx = (lv8_context*)lua_newuserdata(L, sizeof(*ctx));
   memset(ctx, 0, sizeof(*ctx));
