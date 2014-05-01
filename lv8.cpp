@@ -194,6 +194,7 @@ static Local<Value> convert_lua2js(lua_State *L, int idx)
     persistent_add(L, idx, wrapper); // Wrap Lua object at stack index 1.
     no->SetAlignedPointerInInternalField(0, (void*)wrapper);
     wrapper->object.SetWeak(L, js_weak_callback);
+    lua_pop(L, 1);
   }
 out:;
   return scope.Escape(Local<Object>::New(ISOLATE, wrapper->object));
@@ -264,9 +265,10 @@ int lv8_create_context(struct lua_State *L)
   Local<Object> g = c->Global();
   ctx->context.Reset(ISOLATE, c);
   ctx->object.Reset(ISOLATE, g);
-  if (lua_gettop(L) > 0 && lua_istable(L, 1)) {
+  if (lua_gettop(L) > 1 && lua_istable(L, 1)) {
     c->Enter();
-    for (lua_pushnil(L); lua_next(L, 1);) { // Populate from table.
+    lua_pushnil(L);
+    while (lua_next(L, 1)) { // Populate from table.
       g->Set(convert_lua2js(L, -2), convert_lua2js(L, -1));
       lua_pop(L, 1); // Pop value, keep key for next.
     }
@@ -560,9 +562,9 @@ static void lv8_getidx_cb(uint32_t idx,
     const PropertyCallbackInfo<Value> &info)
 {
   UNWRAP_L;
-  settab(L);
-  lua_pushnumber(L, idx);
+  gettab(L);
   convert_js2lua(L, info.Holder());
+  lua_pushnumber(L, idx);
   if (exception(L, 2, 1)) {
     info.GetReturnValue().Set(Undefined(ISOLATE));
     return;
@@ -671,8 +673,6 @@ static void lv8_enumprop_cb(const PropertyCallbackInfo<Array> &info)
 
 static void lv8_enumidx_cb(const PropertyCallbackInfo<Array> &info)
 {
-  // UB: This works since above we enum integer keys as well.
-  info.GetReturnValue().Set(Array::New(ISOLATE));
 }
 
 /* Calls from JS to Lua. 'v8::' Because of namespace clash. */
