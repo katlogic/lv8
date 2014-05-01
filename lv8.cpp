@@ -184,6 +184,9 @@ int lv8_new_context(struct lua_State *L)
 /* Convert Lua value to JS counterpart. */
 static Local<Value> convert_lua2js(lua_State *L, int idx)
 {
+  if (idx < 0) // Convert to absolute index.
+    idx += lua_gettop(L) + 1;
+
   EscapableHandleScope scope(ISOLATE);
   switch (lua_type(L, idx)) { // Base types.
     case LUA_TBOOLEAN:
@@ -236,7 +239,6 @@ static void convert_js2lua(lua_State *L, const Local<Value> &v)
     lua_pushlstring(L, *str, str.length());
   } else { // Must be some sort of other object.
     Local<Object> o = v->ToObject();
-
     if (PROXY->HasInstance(v)) { // Possibly wrapped Lua.
       persistent_lookup_js(L, (lv8_object*)
           o->GetAlignedPointerFromInternalField(0));
@@ -609,7 +611,7 @@ static void lv8_js2lua_call(const v8::FunctionCallbackInfo<Value> &info)
 {
   HandleScope scope(ISOLATE); // To kill locals below.
   UNWRAP_L;
-  Handle<Object> self = info.This();
+  Handle<Object> self = info.Holder();
   int argc = info.Length();
   int top = lua_gettop(L);
 
