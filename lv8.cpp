@@ -280,14 +280,35 @@ int lv8_create_context(struct lua_State *L)
   ctx->object.Reset(ISOLATE, gl);
   ctx->object.SetWeak(L, js_weak_callback);
   persistent_add(L, lua_gettop(L), ctx); // Map udata.
-  if (lua_gettop(L) > 1 && lua_istable(L, 1)) {
-    c->Enter();
-    lua_pushnil(L);
-    while (lua_next(L, 1)) { // Populate from table.
-      gl->Set(convert_lua2js(L, -2), convert_lua2js(L, -1));
-      lua_pop(L, 1); // Pop value, keep key for next.
+  if (lua_gettop(L) > 1) { // Initializer?
+    if (lua_istable(L, 1)) { // From table.
+      c->Enter();
+      lua_pushnil(L);
+      while (lua_next(L, 1)) { // Populate from table.
+        gl->Set(convert_lua2js(L, -2), convert_lua2js(L, -1));
+        lua_pop(L, 1); // Pop value, keep key for next.
+      }
+      c->Exit();
     }
-    c->Exit();
+    if (lv8_object *o = (lv8_object*)lua_touserdata(L, 1)) {
+      if (!lua_getmetatable(L, 1))
+        return 1;
+      if (lua_rawequal(L, -1, CTXMT) || lua_rawequal(L, -1, OBJMT)) {
+        c->Enter();
+        Local<Object> init = OREF(o);
+        Local<Array> a = init->GetPropertyNames();
+        uint32_t n = a->Length();
+        for (uint32_t i = 0; i < n; i++) {
+          Local<Value> propname = a->Get(i);
+          a->CreationContext()->Enter();
+          Local<Value> val = init->Get(propname);
+          a->CreationContext()->Exit();
+          gl->Set(propname, val);
+        }
+        c->Exit();
+      }
+      lua_pop(L, 1);
+    }
   }
   return 1;
 }
