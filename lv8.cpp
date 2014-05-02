@@ -180,7 +180,7 @@ static Local<Value> convert_lua2js(lua_State *L, int idx)
   if (wrapper && lua_getmetatable(L, idx)) { // Possibly wrapped.
     if (lua_rawequal(L, -1, OBJMT) || lua_rawequal(L, -1, CTXMT)) {
       lua_pop(L, 1);
-      goto out; // Unwrap JS object.
+      goto unwrap; // Unwrap JS object.
     }
     lua_pop(L, 1);
   }
@@ -196,7 +196,7 @@ static Local<Value> convert_lua2js(lua_State *L, int idx)
     wrapper->object.SetWeak(L, js_weak_callback);
     lua_pop(L, 1);
   }
-out:;
+unwrap:;
   return scope.Escape(Local<Object>::New(ISOLATE, wrapper->object));
 }
 
@@ -215,11 +215,18 @@ static void convert_js2lua(lua_State *L, const Local<Value> &v)
     lua_pushlstring(L, *str, str.length());
   } else { // Must be some sort of other object.
     Local<Object> o = v->ToObject();
-    if (PROXY->HasInstance(v)) { // Possibly wrapped Lua.
+    if (PROXY->HasInstance(v)) { // Possibly wrapped Lua (or sandbox).
       persistent_lookup_js(L, (lv8_object*)
           o->GetAlignedPointerFromInternalField(0));
       assert(!lua_isnil(L, -1));
       return; // Unwrapped Lua object.
+    }
+    /* Global object (never a proxy). */
+    if (o->CreationContext()->Global()->GetPrototype()->ToObject() == o) {
+      persistent_lookup_js(L, (lv8_object*)
+          o->GetAlignedPointerFromInternalField(0));
+      assert(!lua_isnil(L, -1));
+      return; // Unwrapped context object.
     }
 #if LV8_CACHE_PERSISTENT
     /* 
@@ -259,19 +266,25 @@ int lv8_create_context(struct lua_State *L)
 {
   HandleScope scope(ISOLATE);
   lv8_checkstate(L);
+  Local<ObjectTemplate> tpl = ObjectTemplate::New();
+  tpl->SetInternalFieldCount(1);
   lv8_context *ctx = (lv8_context*)lua_newuserdata(L, sizeof(*ctx));
   memset(ctx, 0, sizeof(*ctx));
   lua_pushvalue(L, CTXMT); // Associate obj mt.
   lua_setmetatable(L, -2);
-  Local<Context> c = Context::New(ISOLATE);
-  Local<Object> g = c->Global();
+  Local<Context> c = Context::New(ISOLATE, 0, tpl);
+  Local<Object> glproxy = c->Global();
+  Local<Object> gl = glproxy->GetPrototype()->ToObject();
+  gl->SetAlignedPointerInInternalField(0, (void*)ctx);
   ctx->context.Reset(ISOLATE, c);
-  ctx->object.Reset(ISOLATE, g);
+  ctx->object.Reset(ISOLATE, gl);
+  ctx->object.SetWeak(L, js_weak_callback);
+  persistent_add(L, lua_gettop(L), ctx); // Map udata.
   if (lua_gettop(L) > 1 && lua_istable(L, 1)) {
     c->Enter();
     lua_pushnil(L);
     while (lua_next(L, 1)) { // Populate from table.
-      g->Set(convert_lua2js(L, -2), convert_lua2js(L, -1));
+      gl->Set(convert_lua2js(L, -2), convert_lua2js(L, -1));
       lua_pop(L, 1); // Pop value, keep key for next.
     }
     c->Exit();
@@ -296,11 +309,11 @@ int lv8_create_sandbox(struct lua_State *L)
 
     Local<Context> c = Context::New(ISOLATE, 0, PROXY->InstanceTemplate());
     ctx->context.Reset(ISOLATE, c);
-    persistent_add(L, 1, ctx);
     Local<Object> gl = c->Global();
     gl->SetAlignedPointerInInternalField(0, (void*)ctx);
     ctx->object.Reset(ISOLATE, gl); // Intercept.
     ctx->object.SetWeak(L, js_weak_callback);
+    persistent_add(L, 1, ctx);
   } else 
     luaL_argerror(L, 1, "sandbox proxy");
 
@@ -415,11 +428,11 @@ static int lv8_obj_tostring(lua_State *L)
     if (PROXY->HasInstance(o)) { // Sandbox.
       persistent_lookup_js(L, p);
       assert(!lua_isnil(L,-1));
-      lua_pushfstring(L,"js<*sandbox>: %p", *o);
+      lua_pushfstring(L,"js<*sandbox>: %p", o->GetAlignedPointerFromInternalField(0));
     } else {
-      lua_pushfstring(L,"js<*context>: %p", *o);
+      lua_pushfstring(L,"js<*context>: %p", o->GetAlignedPointerFromInternalField(0));
     }
-  }else {
+  } else {
     if (o->IsNativeError()) {
       Local<Object> tb = o->Get(NEWSTR("traceback"))->ToObject();
       if (!tb.IsEmpty()) {
