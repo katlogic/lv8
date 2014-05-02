@@ -39,5 +39,8 @@ struct lv8_context : lv8_object {
 struct lv8_state {
   int initialized;
   v8::Persistent<v8::FunctionTemplate> proxy;
+  v8::Persistent<v8::ObjectTemplate> gtpl;
 };
+
+v8::Local<v8::ObjectTemplate> lv8_fs_init();
 

@@ -35,6 +35,7 @@
 using namespace v8;
 /* Optional performance hacks. */
 #define LV8_CACHE_PERSISTENT 1 // Set to 0 if this turns out slow.
+#define LV8_FS_API 1
 
 /* lua_pushuserdata() is needed for Persistent<> caching. */
 #if LV8_CACHE_PERSISTENT
@@ -52,6 +53,7 @@ using namespace v8;
 #define V8_STATE ((lv8_state*)lua_touserdata(L, STATEUD))
 #define ISOLATE Isolate::GetCurrent()
 #define PROXY Local<FunctionTemplate>::New(ISOLATE, V8_STATE->proxy)
+#define GTPL Local<ObjectTemplate>::New(ISOLATE, V8_STATE->gtpl)
 #define LOCAL(v) Local<Value>::New(ISOLATE, (v))
 #define OREF(v) Local<Object>::New(ISOLATE, (v->object))
 #define REF(t,v) Local<t>::New(ISOLATE, (v))
@@ -266,13 +268,11 @@ int lv8_create_context(struct lua_State *L)
 {
   HandleScope scope(ISOLATE);
   lv8_checkstate(L);
-  Local<ObjectTemplate> tpl = ObjectTemplate::New();
-  tpl->SetInternalFieldCount(1);
   lv8_context *ctx = (lv8_context*)lua_newuserdata(L, sizeof(*ctx));
   memset(ctx, 0, sizeof(*ctx));
   lua_pushvalue(L, CTXMT); // Associate obj mt.
   lua_setmetatable(L, -2);
-  Local<Context> c = Context::New(ISOLATE, 0, tpl);
+  Local<Context> c = Context::New(ISOLATE, 0, GTPL);
   Local<Object> glproxy = c->Global();
   Local<Object> gl = glproxy->GetPrototype()->ToObject();
   gl->SetAlignedPointerInInternalField(0, (void*)ctx);
@@ -745,6 +745,7 @@ static int lv8_flags(lua_State *L)
   return 1; // Allow method chaining.
 }
 
+
 /* Initialize global state. */
 static void lv8_checkstate(lua_State *L)
 {
@@ -752,9 +753,19 @@ static void lv8_checkstate(lua_State *L)
   if (!state->initialized) {
     state->initialized = 1;
     HandleScope scope(ISOLATE);
+
+    Handle<ObjectTemplate> gtpl = ObjectTemplate::New();
+    gtpl->SetInternalFieldCount(1); // Normal context template.
+    state->gtpl.Reset(ISOLATE, gtpl);
+
+#if LV8_FS_API
+    gtpl->Set(NEWSTR("fs"), lv8_fs_init());
+#endif
+
     Local<FunctionTemplate> proxy =
-      FunctionTemplate::New(ISOLATE);
+      FunctionTemplate::New(ISOLATE); // Sandbox proxy template.
     state->proxy.Reset(ISOLATE, proxy);
+
     Handle<ObjectTemplate> tpl = proxy->InstanceTemplate();
     tpl->SetInternalFieldCount(1); // Points to wrapped lua object.
     tpl->SetNamedPropertyHandler( // Named properties.
@@ -797,6 +808,7 @@ int luaclose_lv8(lua_State *L)
 {
   lv8_state *state = (lv8_state*)lua_touserdata(L, 1);
   state->proxy.Reset(); // Should have no refs.
+  state->gtpl.Reset(); // Should have no refs.
   return 0;
 }
 
