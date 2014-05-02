@@ -252,10 +252,13 @@ static void convert_js2lua(lua_State *L, const Local<Value> &v)
   }
 }
 
+static void lv8_checkstate(lua_State *L);
+
 /* Construct new JS context. */
 int lv8_create_context(struct lua_State *L)
 {
   HandleScope scope(ISOLATE);
+  lv8_checkstate(L);
   lv8_context *ctx = (lv8_context*)lua_newuserdata(L, sizeof(*ctx));
   memset(ctx, 0, sizeof(*ctx));
   lua_pushvalue(L, CTXMT); // Associate obj mt.
@@ -284,6 +287,7 @@ static int lv8_create_context_call(struct lua_State *L) {
 int lv8_create_sandbox(struct lua_State *L)
 {
   if (lua_gettop(L) >= 1) {
+    lv8_checkstate(L);
     HandleScope scope(ISOLATE);
     lv8_context *ctx = (lv8_context*)lua_newuserdata(L, sizeof(*ctx));
     memset(ctx, 0, sizeof(*ctx));
@@ -659,13 +663,10 @@ static void lv8_enumprop_cb(const PropertyCallbackInfo<Array> &info)
   i = 0;
   lua_pushnil(L); // First key.
   for (i = 0; lua_next(L, -2); i++) {
-    if (i == n) // Filled guessed size? Expand the array.
-      a->Set(NEWSTR("length"), Integer::New(ISOLATE, n += 8));
     a->Set(i, convert_lua2js(L, -2)); // Set key.
     lua_pop(L, 1); // Pop value.
   }
   lua_pop(L, 1); // Pop table.
-  a->Set(NEWSTR("length"), Integer::New(ISOLATE, i));
   info.GetReturnValue().Set(a);
 }
 
@@ -691,17 +692,47 @@ static void lv8_js2lua_call(const v8::FunctionCallbackInfo<Value> &info)
   }
 
   int nres = lua_gettop(L) - top; // Convert output results.
-  if (!nres) { // No results.
-    info.GetReturnValue().Set(Undefined(ISOLATE));
-  } if (nres == 1) { // Single result.
-    info.GetReturnValue().Set(convert_lua2js(L, -1));
-  } else { // Multiple results will go into array.
-    Local<Array> array = Array::New(ISOLATE, nres);
-    for (uint32_t i = 0; i < nres; i++)
-      array->Set(i, convert_lua2js(L, top + i + 1));
-    info.GetReturnValue().Set(array);
-  }
+  Local<Array> array = Array::New(ISOLATE, nres);
+  for (uint32_t i = 0; i < nres; i++)
+    array->Set(i, convert_lua2js(L, top + i + 1));
+  info.GetReturnValue().Set(array);
   lua_pop(L, nres);
+}
+
+/* Configure V8 flags. */
+static int lv8_flags(lua_State *L)
+{
+  int top = lua_gettop(L);
+  size_t n;
+  for (int i = 1; i <= top; i++)
+    if (const char *s = lua_tolstring(L, i, &n))
+      V8::SetFlagsFromString(s, (int)n);
+  lua_settop(L, 1);
+  return 1; // Allow method chaining.
+}
+
+/* Initialize global state. */
+static void lv8_checkstate(lua_State *L)
+{
+  lv8_state *state = V8_STATE;
+  if (!state->initialized) {
+    state->initialized = 1;
+    HandleScope scope(ISOLATE);
+    Local<FunctionTemplate> proxy =
+      FunctionTemplate::New(ISOLATE);
+    state->proxy.Reset(ISOLATE, proxy);
+    Handle<ObjectTemplate> tpl = proxy->InstanceTemplate();
+    tpl->SetInternalFieldCount(1); // Points to wrapped lua object.
+    tpl->SetNamedPropertyHandler( // Named properties.
+        lv8_getprop_cb, lv8_setprop_cb, 0,
+        lv8_delprop_cb, lv8_enumprop_cb,
+        External::New(ISOLATE, L));
+    tpl->SetIndexedPropertyHandler( // Indexed properties.
+        lv8_getidx_cb, lv8_setidx_cb, 0,
+        lv8_delidx_cb, 0,
+        External::New(ISOLATE, L));
+    tpl->SetCallAsFunctionHandler(lv8_js2lua_call, External::New(ISOLATE, L));
+  }
 }
 
 /* Metatable set for OBJMT JS proxy. */
@@ -719,6 +750,7 @@ static const struct luaL_Reg lv8_object_mt[] = {
 
 /* Library. */
 static const struct luaL_Reg lv8_lib[] = {
+  { "flags",    lv8_flags },          // Set V8 flags.
   { "new",      lv8_create_instance },// Call 'new' in JS to construct instance.
   { "sandbox",  lv8_create_sandbox }, // Create sandbox.
   { "context",  lv8_create_context }, // Create JS context.
@@ -737,15 +769,6 @@ int luaclose_lv8(lua_State *L)
 /* Lua and V8 states. */
 int luaopen_lv8(lua_State *L)
 {
-  HandleScope scope(ISOLATE); // To kill locals below.
-
-  while (lua_gettop(L) > 1) { // eg. require("lv8", "--harmony --use_strict")
-    size_t n;
-    if (const char *s = lua_tolstring(L, 1, &n))
-      V8::SetFlagsFromString(s, (int)n);
-    lua_pop(L, 1);
-  }
-
   lua_settop(L, 0);
 
   /* Library lives at 1. */
@@ -756,20 +779,6 @@ int luaopen_lv8(lua_State *L)
   /* Globally shared state which holds our proxy template. */
   lv8_state *state = (lv8_state*) lua_newuserdata(L, sizeof(lv8_state));
   memset(state, 0, sizeof(*state));
-  Local<FunctionTemplate> proxy =
-    FunctionTemplate::New(ISOLATE);
-  state->proxy.Reset(ISOLATE, proxy);
-  Handle<ObjectTemplate> tpl = proxy->InstanceTemplate();
-  tpl->SetInternalFieldCount(1); // Points to wrapped lua object.
-  tpl->SetNamedPropertyHandler( // Named properties.
-      lv8_getprop_cb, lv8_setprop_cb, 0,
-      lv8_delprop_cb, lv8_enumprop_cb,
-      External::New(ISOLATE, L));
-  tpl->SetIndexedPropertyHandler( // Indexed properties.
-      lv8_getidx_cb, lv8_setidx_cb, 0,
-      lv8_delidx_cb, 0,
-      External::New(ISOLATE, L));
-  tpl->SetCallAsFunctionHandler(lv8_js2lua_call, External::New(ISOLATE, L));
   lua_newtable(L); // State cleanup mt.
   lua_pushcfunction(L, luaclose_lv8);
   lua_setfield(L, -2, "__gc");

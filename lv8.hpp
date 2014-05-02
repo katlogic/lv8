@@ -37,6 +37,7 @@ struct lv8_context : lv8_object {
 };
 
 struct lv8_state {
+  int initialized;
   v8::Persistent<v8::FunctionTemplate> proxy;
 };
 
