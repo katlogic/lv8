@@ -38,6 +38,7 @@
 #include <sys/time.h>
 
 
+#if LV8_FS_API
 using namespace v8;
 
 /* Raw filesystem mini-api. Handholding to be done in JS. */
@@ -221,4 +222,5 @@ Local<ObjectTemplate> lv8_fs_init()
   DEF_ERR(FS_CONST)
   return scope.Escape(fs);
 }
+#endif
 

@@ -33,9 +33,6 @@
 #include "lv8.hpp"
 
 using namespace v8;
-/* Optional performance hacks. */
-#define LV8_CACHE_PERSISTENT 1 // Set to 0 if this turns out slow.
-#define LV8_FS_API 1
 
 /* lua_pushuserdata() is needed for Persistent<> caching. */
 #if LV8_CACHE_PERSISTENT
