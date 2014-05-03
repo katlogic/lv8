@@ -28,6 +28,7 @@
 #endif
 #include <assert.h>
 #include <string.h>
+#include <stdlib.h>
 
 #define LV8_CPP
 #include "lv8.hpp"
@@ -119,12 +120,14 @@ static int lv8_obj_gc(lua_State *L)
   assert(!lua_isnil(L, -1));
   if (lua_rawequal(L, -1, CTXMT)) {
     o->context.Reset(); // Kill context if it is one.
-  } else assert(lua_rawequal(L, -1, OBJMT));
+  } else {
+    assert(lua_rawequal(L, -1, OBJMT));
 #if LV8_CACHE_PERSISTENT
-  HandleScope scope(ISOLATE);
-  OREF(o)->SetHiddenValue(NEWSTR(LV8_IDENTITY),
+    HandleScope scope(ISOLATE);
+    OREF(o)->SetHiddenValue(NEWSTR(LV8_IDENTITY),
       Undefined(ISOLATE));
 #endif
+  }
   o->object.Reset();
   return 0;
 }
@@ -141,11 +144,13 @@ js_weak_callback(const WeakCallbackData<v8::Object, lua_State> &data)
   persistent_lookup_js(L, (lv8_object*)v); // Lookup Lua object.
 
 #ifndef NDEBUG
-  lua_getmetatable(L, -1); // These should always short-circuit long before.
-  assert(!(lua_rawequal(L, -1, OBJMT) || lua_rawequal(L, -1, CTXMT)));
-  lua_pop(L, 1);
+  if (lua_getmetatable(L, -1)) { // These should always short-circuit long before.
+    assert(!(lua_rawequal(L, -1, OBJMT) || lua_rawequal(L, -1, CTXMT)));
+    lua_pop(L, 1);
+  }
 #endif
 
+  printf("weak called! %p %d\n", v, lua_gettop(L), L);
   lua_pushnil(L);
   lua_rawset(L, REFTAB); // Clear Lua -> JS.
   lua_pushlightuserdata(L, (void*)v);
@@ -327,7 +332,7 @@ int lv8_create_sandbox(struct lua_State *L)
 
     Local<Context> c = Context::New(ISOLATE, 0, PROXY->InstanceTemplate());
     ctx->context.Reset(ISOLATE, c);
-    Local<Object> gl = c->Global();
+    Local<Object> gl = c->Global()->GetPrototype()->ToObject();
     gl->SetAlignedPointerInInternalField(0, (void*)ctx);
     ctx->object.Reset(ISOLATE, gl); // Intercept.
     ctx->object.SetWeak(L, js_weak_callback);
@@ -742,12 +747,32 @@ static int lv8_flags(lua_State *L)
   return 1; // Allow method chaining.
 }
 
+static int lv8_force_gc(lua_State *L)
+{
+  ISOLATE->RequestGarbageCollectionForTesting(Isolate::kFullGarbageCollection);
+}
+
+class lv8_ab_allocator : public ArrayBuffer::Allocator {
+  public:
+  virtual void* Allocate(size_t length) {
+    void *data = calloc(length, 1);
+    return data;
+  }
+  virtual void* AllocateUninitialized(size_t length) {
+    void *data = malloc(length);
+    return data;
+  }
+  virtual void Free(void* data, size_t length) {
+    free(data);
+  }
+};
 
 /* Initialize global state. */
 static void lv8_checkstate(lua_State *L)
 {
   lv8_state *state = V8_STATE;
   if (!state->initialized) {
+    V8::SetArrayBufferAllocator(new lv8_ab_allocator());
     state->initialized = 1;
     HandleScope scope(ISOLATE);
 
@@ -793,6 +818,7 @@ static const struct luaL_Reg lv8_object_mt[] = {
 /* Library. */
 static const struct luaL_Reg lv8_lib[] = {
   { "flags",    lv8_flags },          // Set V8 flags.
+  { "gc",       lv8_force_gc},        // Force gc.
   { "new",      lv8_create_instance },// Call 'new' in JS to construct instance.
   { "sandbox",  lv8_create_sandbox }, // Create sandbox.
   { "context",  lv8_create_context }, // Create JS context.
