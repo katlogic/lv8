@@ -756,7 +756,7 @@ static void lv8_checkstate(lua_State *L)
     state->gtpl.Reset(ISOLATE, gtpl);
 
 #if LV8_FS_API
-    gtpl->Set(NEWSTR("fs"), lv8_fs_init());
+    gtpl->Set(NEWSTR("llfs"), lv8_fs_init());
 #endif
 
     Local<FunctionTemplate> proxy =
