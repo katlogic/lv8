@@ -114,16 +114,69 @@ static void persistent_add(lua_State *L, int idx, lv8_object *v)
   lua_rawset(L, REFTAB); // Map reftab[js] = lua.
 }
 
+/* Kill persistent mapping, expects lv8_object udata on stack. */
+static void persistent_del(lua_State *L, lv8_object *v)
+{
+  assert(!lua_isnil(L, -1));
+  assert(lua_touserdata(L, -1) == v);
+  lua_pushnil(L);
+  lua_rawset(L, REFTAB); // Clear Lua -> JS.
+  lua_pushlightuserdata(L, (void*)v);
+  printf("unpersist %p\n", v);
+  lua_pushnil(L);
+  lua_rawset(L, REFTAB); // Clear JS -> Lua.
+}
+
+/* Context which was made weak by obj_gc is collected. */
+static void
+js_weak_context(const WeakCallbackData<Context, lua_State> &data)
+{
+  HandleScope scope(ISOLATE);
+  Local<Object> o = data.GetValue()->Global()->GetPrototype()->ToObject();
+  lv8_context *v = (lv8_context*)o->GetAlignedPointerFromInternalField(0);
+  v->context.Reset(); // This should trigger object collection below
+  v->object.Reset();
+  v->jscollected = 1;
+}
+
+/* Last reference to Lua object from JS died. Remove refs on Lua side. */
+static void
+js_weak_object(const WeakCallbackData<v8::Object, lua_State> &data)
+{
+  HandleScope scope(ISOLATE);
+  Local<Object> o = data.GetValue();
+  lv8_object *v;
+  lua_State *L = data.GetParameter();
+  v = (lv8_object*)o->GetAlignedPointerFromInternalField(0);
+
+  persistent_lookup_js(L, (lv8_object*)v); // Lookup Lua object.
+  assert(!lua_isnil(L, -1)); // Must be tracked.
+  printf("weako?!\n");
+  persistent_del(L, v);
+
+  v->object.Reset(); // And kill the Persistent.
+}
+
+
 /* Last reference of Lua object released. */
 static int lv8_obj_gc(lua_State *L)
 {
   HandleScope scope(ISOLATE);
-  lv8_object *o = (lv8_object*)lua_touserdata(L, 1);
+  lv8_context *o = (lv8_context*)lua_touserdata(L, 1);
   assert(o);
   lua_getmetatable(L, 1);
   assert(!lua_isnil(L, -1));
   if (lua_rawequal(L, -1, CTXMT)) {
-    /* NO-OP. *OREF(o) might be null if weak above triggered. */
+    if (!o->jscollected) { // Not already collected context?
+      printf("resurrect %p\n", o);
+      lua_pushuserdata_resurrect(L, 1);
+      lua_pushvalue(L, CTXMT);
+      lua_setmetatable(L, 1);
+      o->context.SetWeak(L, js_weak_context);
+      persistent_add(L, 1, o); // Resurrect until js_weak_context kicks in.
+      o->resurrected = 1;
+      return 0;
+    } // NO-OP. *OREF(o) might be null if it was weak already.
   } else {
     assert(lua_rawequal(L, -1, OBJMT));
 #if LV8_CACHE_PERSISTENT
@@ -133,36 +186,6 @@ static int lv8_obj_gc(lua_State *L)
   }
   o->object.Reset();
   return 0;
-}
-
-/* Last reference to Lua object from JS died. Remove refs on Lua side. */
-static void
-js_weak_callback(const WeakCallbackData<v8::Object, lua_State> &data)
-{
-  HandleScope scope(ISOLATE);
-  Local<Object> o = data.GetValue();
-  lv8_object *v;
-  lua_State *L = data.GetParameter();
-  if (!PROXY->HasInstance(o)) // Resolve true object underneath proxy.
-    o = o->GetPrototype()->ToObject();
-  v = (lv8_object*)o->GetAlignedPointerFromInternalField(0);
-
-  persistent_lookup_js(L, (lv8_object*)v); // Lookup Lua object.
-
-#ifndef NDEBUG
-  if (lua_getmetatable(L, -1)) { // These should always short-circuit long before.
-    assert(!lua_rawequal(L, -1, OBJMT));
-    lua_pop(L, 1);
-  }
-#endif
-
-  lua_pushnil(L);
-  lua_rawset(L, REFTAB); // Clear Lua -> JS.
-  lua_pushlightuserdata(L, (void*)v);
-  lua_pushnil(L);
-  lua_rawset(L, REFTAB); // Clear JS -> Lua.
-
-  v->object.Reset(); // And kill the Persistent.
 }
 
 /* Convert Lua value to JS counterpart. */
@@ -202,7 +225,8 @@ static Local<Value> convert_lua2js(lua_State *L, int idx)
     wrapper->object.Reset(ISOLATE, no); // Anchor proxy in JS
     persistent_add(L, idx, wrapper); // Anchor Persistent<> UD in Lua
     no->SetAlignedPointerInInternalField(0, (void*)wrapper);
-    wrapper->object.SetWeak(L, js_weak_callback);
+    wrapper->object.SetWeak(L, js_weak_object);
+//    wrapper->object.MarkIndependent();
     lua_pop(L, 1);
   }
 unwrap:;
@@ -224,17 +248,19 @@ static void convert_js2lua(lua_State *L, const Local<Value> &v)
     lua_pushlstring(L, *str, str.length());
   } else { // Must be some sort of other object.
     Local<Object> o = v->ToObject();
-    if (PROXY->HasInstance(v)) { // Possibly wrapped Lua (or sandbox).
-      persistent_lookup_js(L, (lv8_object*)
-          o->GetAlignedPointerFromInternalField(0));
-      assert(!lua_isnil(L, -1));
-      return; // Unwrapped Lua object.
-    }
-    /* Global object (never a proxy). */
-    if (o->CreationContext()->Global()->GetPrototype()->ToObject() == o) {
-      persistent_lookup_js(L, (lv8_object*)
-          o->GetAlignedPointerFromInternalField(0));
-      assert(!lua_isnil(L, -1));
+    if (PROXY->HasInstance(v) || // Is it a sandbox or context?
+        o->CreationContext()->Global()->GetPrototype()->ToObject() == o) {
+      lv8_context *c = (lv8_context*)o->GetAlignedPointerFromInternalField(0);
+      assert(!c->jscollected); // Must not be past weak_context.
+      if (c->resurrected) { // Caught mid-gc phase.
+        printf("unres %p\n", c);
+        c->context.ClearWeak();
+        lua_pushuserdata(L, (void*)c);
+        persistent_del(L, c); // Undo resurrection.
+        c->resurrected = 0;
+      }
+      lua_pushuserdata(L, (void*)c);
+      printf("conv %d", lua_gettop(L));
       return; // Unwrapped context object.
     }
 #if LV8_CACHE_PERSISTENT
@@ -252,7 +278,7 @@ static void convert_js2lua(lua_State *L, const Local<Value> &v)
      */
     Local<String> idstr = NEWSTR(LV8_IDENTITY);
     Local<Value> identity = o->GetHiddenValue(idstr);
-    if (!identity.IsEmpty()) {
+    if (!identity.IsEmpty() && !identity->IsUndefined()) {
       lua_pushuserdata(L, External::Cast(*identity)->Value());
       return; // Already wrapped JS object.
     }
@@ -275,7 +301,7 @@ int lv8_create_context(struct lua_State *L)
 {
   HandleScope scope(ISOLATE);
   lv8_checkstate(L);
-  lv8_object *ctx = (lv8_object*)lua_newuserdata(L, sizeof(*ctx));
+  lv8_context *ctx = (lv8_context*)lua_newuserdata(L, sizeof(*ctx));
   memset(ctx, 0, sizeof(*ctx));
   lua_pushvalue(L, CTXMT); // Associate obj mt.
   lua_setmetatable(L, -2);
@@ -283,10 +309,13 @@ int lv8_create_context(struct lua_State *L)
   Local<Context> c = Context::New(ISOLATE, 0, GTPL);
   Local<Object> glproxy = c->Global();
   Local<Object> gl = glproxy->GetPrototype()->ToObject();
+  ctx->context.Reset(ISOLATE, c);
   gl->SetAlignedPointerInInternalField(0, (void*)ctx);
-  ctx->object.Reset(ISOLATE, glproxy);
-  ctx->object.SetWeak(L, js_weak_callback);
-  persistent_add(L, lua_gettop(L), ctx); // Map udata.
+  ctx->object.Reset(ISOLATE, gl);
+  ctx->object.SetWeak(L, js_weak_object);
+//  ctx->object.MarkIndependent();
+  //ctx->object.MarkIndependent();
+  //persistent_add(L, lua_gettop(L), ctx); // Map udata.
   if (lua_gettop(L) > 1) { // Initializer?
     if (lua_istable(L, 1)) { // From table.
       c->Enter();
@@ -330,18 +359,19 @@ int lv8_create_sandbox(struct lua_State *L)
   if (lua_gettop(L) >= 1) {
     lv8_checkstate(L);
     HandleScope scope(ISOLATE);
-    lv8_object *ctx = (lv8_object*)lua_newuserdata(L, sizeof(*ctx));
+    lv8_context *ctx = (lv8_context*)lua_newuserdata(L, sizeof(*ctx));
     memset(ctx, 0, sizeof(*ctx));
     lua_pushvalue(L, CTXMT); // Associate obj mt.
     lua_setmetatable(L, -2);
 
     Local<Context> c = Context::New(ISOLATE, 0, PROXY->InstanceTemplate());
+    ctx->context.Reset(ISOLATE, c);
     Local<Object> glproxy = c->Global();
     Local<Object> gl = c->Global()->GetPrototype()->ToObject();
     gl->SetAlignedPointerInInternalField(0, (void*)ctx);
-    ctx->object.Reset(ISOLATE, glproxy); // Intercept.
-    ctx->object.SetWeak(L, js_weak_callback);
-    persistent_add(L, 1, ctx);
+    ctx->object.Reset(ISOLATE, gl); // Intercept.
+    ctx->object.SetWeak(L, js_weak_object);
+//    ctx->object.MarkIndependent();
   } else 
     luaL_argerror(L, 1, "sandbox proxy");
 
@@ -536,7 +566,9 @@ static int lv8_obj_pairs(lua_State *L)
   lua_createtable(L, n, 2); // Table t.
   for (uint32_t i = 0; i < n; i++) {
     Local<Value> propname = a->Get(i);
-    if (propname.IsEmpty())
+    if (propname.IsEmpty()||
+        propname->IsUndefined() ||
+        propname->IsNull())
       continue;
     convert_js2lua(L, propname); // Key.
     convert_js2lua(L, o->Get(propname)); // Val.
@@ -779,6 +811,7 @@ class lv8_ab_allocator : public ArrayBuffer::Allocator {
     return data;
   }
   virtual void Free(void* data, size_t length) {
+    printf("freeing\n");
     free(data);
   }
 };

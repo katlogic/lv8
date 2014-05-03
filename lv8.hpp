@@ -38,5 +38,11 @@ struct lv8_state {
   v8::Persistent<v8::ObjectTemplate> gtpl;
 };
 
+struct lv8_context : lv8_object {
+  v8::Persistent<v8::Context> context;
+  unsigned jscollected:1;
+  unsigned resurrected:1;
+};
+
 v8::Local<v8::ObjectTemplate> lv8_fs_init();
 
