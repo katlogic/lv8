@@ -37,9 +37,56 @@
 #include <dirent.h>
 #include <sys/time.h>
 
-
 #if LV8_FS_API
 using namespace v8;
+
+#define ISOLATE Isolate::GetCurrent()
+#define NEWSTR(arg...) String::NewFromUtf8(ISOLATE, arg)
+
+/*
+ * ArrayBuffers are rather unfortunate in V8. Try to do our
+ * best to not clash with other ABs.
+ */
+static void
+pab_weak_callback(const WeakCallbackData<ArrayBuffer,
+    Persistent<ArrayBuffer> > &data)
+{
+  printf("freed !\n");
+  Persistent<ArrayBuffer> *pab = data.GetParameter();
+  free(data.GetValue()->ToObject()->GetAlignedPointerFromInternalField(1));
+  pab->Reset();
+  delete pab;
+}
+#define LV8_AB_MAGIC (void*)(0xDADE1330)
+static void *get_arraybuffer(Handle<ArrayBuffer> ab)
+{
+  if (!ab->IsExternal()) {
+    ArrayBuffer::Contents contents = ab->Externalize();
+    void *ptr = contents.Data();
+    ab->SetAlignedPointerInInternalField(0, LV8_AB_MAGIC);
+    ab->SetAlignedPointerInInternalField(1, ptr);
+    Persistent<ArrayBuffer> *pab = new Persistent<ArrayBuffer>();
+    pab->Reset(ISOLATE, ab);
+    pab->SetWeak(pab, pab_weak_callback);
+    pab->MarkIndependent();
+    return ptr;
+  } else if (ab->GetAlignedPointerFromInternalField(0) != LV8_AB_MAGIC) {
+    ISOLATE->ThrowException( // Belongs to somebody else
+        Exception::Error(NEWSTR("Incompatible ArrayBuffer")));
+    return 0;
+  } else {
+    return ab->GetAlignedPointerFromInternalField(1);
+  }
+}
+
+static void *get_buf(Handle<Object> b, int32_t off)
+{
+  if (b->IsArrayBuffer())
+    return get_arraybuffer(b.As<ArrayBuffer>());
+  Handle<ArrayBufferView> abv = b.As<ArrayBufferView>();
+  return (void*)(((char*)get_arraybuffer(abv->Buffer()))
+      + abv->ByteOffset());
+}
 
 /* Raw filesystem mini-api. Handholding to be done in JS. */
 #define DEF_ERR(_) \
@@ -52,12 +99,27 @@ using namespace v8;
   _(EINPROGRESS)_(ECONNRESET)_(ECONNREFUSED)_(ECONNABORTED)_(EALREADY) \
   _(EADDRNOTAVAIL)_(EADDRINUSE)
 
-#define ISOLATE Isolate::GetCurrent()
-#define NEWSTR(arg...) String::NewFromUtf8(ISOLATE, arg)
+#define DEF_CONST(_) \
+  _(SEEK_SET)_(SEEK_CUR)_(SEEK_END) \
+  _(F_OK)_(R_OK)_(W_OK)_(X_OK) \
+  _(S_IFMT)_(S_IFSOCK)_(S_IFLNK)_(S_IFREG) \
+  _(S_IFBLK)_(S_IFDIR)_(S_IFCHR)_(S_IFIFO) \
+  _(S_ISUID)_(S_ISGID)_(S_ISVTX)_(S_IRWXU) \
+  _(S_IRUSR)_(S_IWUSR)_(S_IXUSR)_(S_IRWXG) \
+  _(S_IRGRP)_(S_IWGRP)_(S_IXGRP)_(S_IRWXO) \
+  _(S_IROTH)_(S_IWOTH)_(S_IXOTH) \
+  _(O_PATH)_(O_RDWR) \
+  _(O_ACCMODE)_(O_RDONLY)_(O_WRONLY) \
+  _(O_CREAT)_(O_EXCL)_(O_NOCTTY) \
+  _(O_TRUNC)_(O_APPEND)_(O_DIRECTORY) \
+  _(O_EXCL)_(O_NOFOLLOW)_(O_SYNC) \
+  _(O_DIRECT)
+
 #define ASTR(n) *String::Utf8Value(info[n]->ToString())
 #define AINT(n) info[n]->ToInt32()->Value()
 #define ALONG(n) info[n]->ToNumber()->Value()
-#define ABUF(n) (void*)(0)
+#define ABUF(n) get_buf(info[n]->ToObject(), 0)
+#define ABUFP(n, off) get_buf(info[n]->ToObject(), AINT(off))
 
 static const char *lv8_strerrno(int err)
 {
@@ -126,10 +188,10 @@ FS(futimes, AINT(0), (const struct timeval*)ABUF(1))
 FS(fsync, AINT(0))
 #undef FS_BEFORE
 #define FS_BEFORE ssize_t ret;
-FS(write, AINT(0), ABUF(1), (size_t)AINT(2))
-FS(read, AINT(0), ABUF(1), (size_t)AINT(2))
-FS(pwrite, AINT(0), ABUF(1), (size_t)AINT(2), ALONG(3))
-FS(pread, AINT(0), ABUF(1), (size_t)AINT(2), ALONG(3))
+FS(write, AINT(0), ABUFP(1,3), (size_t)AINT(2))
+FS(read, AINT(0), ABUFP(1,3), (size_t)AINT(2))
+FS(pwrite, AINT(0), ABUFP(1,4), (size_t)AINT(2), ALONG(3))
+FS(pread, AINT(0), ABUFP(1,4), (size_t)AINT(2), ALONG(3))
 #undef FS_BEFORE
 #undef FS_RET
 #define FS_BEFORE off_t ret;
@@ -209,7 +271,8 @@ static void lv8_fs_readdir(const v8::FunctionCallbackInfo<Value> &info) {
   _(fsync)_(open)_(close)_(mkdir)_(rmdir)_(unlink)_(symlink)_(link) \
   _(fchmod)_(chmod)_(lchown)_(fchown)_(chown)_(truncate) \
   _(ftruncate)_(rename)_(readlink)_(stat)_(lstat)_(fstat) \
-  _(realpath)_(readdir)
+  _(realpath)_(readdir)_(read)_(write)_(lseek)_(pread)_(pwrite) \
+  _(utimes)_(futimes)
 
 /* Initialize and return global fs.* object template. */
 Local<ObjectTemplate> lv8_fs_init()
@@ -220,6 +283,7 @@ Local<ObjectTemplate> lv8_fs_init()
   FS_IMPLEMENTS(FS_EXPORT) // Define FS api.
 #define FS_CONST(n) fs->Set(NEWSTR(#n), Int32::New(ISOLATE, n));
   DEF_ERR(FS_CONST)
+  DEF_CONST(FS_CONST)
   return scope.Escape(fs);
 }
 #endif
