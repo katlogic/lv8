@@ -36,11 +36,13 @@
 using namespace v8;
 
 /* lua_pushuserdata() is needed for Persistent<> caching. */
-#if LV8_CACHE_PERSISTENT
 #define LV8_IDENTITY "lv8::identity"
+#define LV8_NEED_FINHACK 1
 #ifndef lua_pushuserdata
 #include "pudata/pudata.h"
-#endif
+#else
+#define lua_newuserdata_old lua_newuserdata
+#define lua_pushuserdata_resurrect(L, idx)
 #endif
 
 /* Default V8 engine flags. */
@@ -122,7 +124,6 @@ static void persistent_del(lua_State *L, lv8_object *v)
   lua_pushnil(L);
   lua_rawset(L, REFTAB); // Clear Lua -> JS.
   lua_pushlightuserdata(L, (void*)v);
-  printf("unpersist %p\n", v);
   lua_pushnil(L);
   lua_rawset(L, REFTAB); // Clear JS -> Lua.
 }
@@ -151,12 +152,25 @@ js_weak_object(const WeakCallbackData<v8::Object, lua_State> &data)
 
   persistent_lookup_js(L, (lv8_object*)v); // Lookup Lua object.
   assert(!lua_isnil(L, -1)); // Must be tracked.
-  printf("weako?!\n");
   persistent_del(L, v);
 
   v->object.Reset(); // And kill the Persistent.
 }
 
+/* Restart finalizer on Lua 5.2/5.3. */
+static void lv8_restart_finalizer(lua_State *L, void *p)
+{
+#if LV8_NEED_FINHACK
+  struct gch_t {
+    void *gcnext;
+    uint8_t tt;
+    uint8_t marked;
+  } *gch = (gch_t*)(((uint8_t*)p) - V8_STATE->finhack);
+#define FINALIZED (1<<3)
+  assert(gch->marked & FINALIZED);
+  gch->marked &= ~FINALIZED;
+#endif
+}
 
 /* Last reference of Lua object released. */
 static int lv8_obj_gc(lua_State *L)
@@ -168,7 +182,7 @@ static int lv8_obj_gc(lua_State *L)
   assert(!lua_isnil(L, -1));
   if (lua_rawequal(L, -1, CTXMT)) {
     if (!o->jscollected) { // Not already collected context?
-      printf("resurrect %p\n", o);
+      lv8_restart_finalizer(L, (void*)o);
       lua_pushuserdata_resurrect(L, 1);
       lua_pushvalue(L, CTXMT);
       lua_setmetatable(L, 1);
@@ -179,10 +193,8 @@ static int lv8_obj_gc(lua_State *L)
     } // NO-OP. *OREF(o) might be null if it was weak already.
   } else {
     assert(lua_rawequal(L, -1, OBJMT));
-#if LV8_CACHE_PERSISTENT
     OREF(o)->SetHiddenValue(NEWSTR(LV8_IDENTITY),
       Undefined(ISOLATE));
-#endif
   }
   o->object.Reset();
   return 0;
@@ -226,7 +238,6 @@ static Local<Value> convert_lua2js(lua_State *L, int idx)
     persistent_add(L, idx, wrapper); // Anchor Persistent<> UD in Lua
     no->SetAlignedPointerInInternalField(0, (void*)wrapper);
     wrapper->object.SetWeak(L, js_weak_object);
-//    wrapper->object.MarkIndependent();
     lua_pop(L, 1);
   }
 unwrap:;
@@ -253,29 +264,14 @@ static void convert_js2lua(lua_State *L, const Local<Value> &v)
       lv8_context *c = (lv8_context*)o->GetAlignedPointerFromInternalField(0);
       assert(!c->jscollected); // Must not be past weak_context.
       if (c->resurrected) { // Caught mid-gc phase.
-        printf("unres %p\n", c);
         c->context.ClearWeak();
         lua_pushuserdata(L, (void*)c);
         persistent_del(L, c); // Undo resurrection.
         c->resurrected = 0;
       }
       lua_pushuserdata(L, (void*)c);
-      printf("conv %d", lua_gettop(L));
       return; // Unwrapped context object.
     }
-#if LV8_CACHE_PERSISTENT
-    /* 
-     * Ok, this is pretty bad. Apparently it is not possible to easily find out
-     * if a JS object already has a persistent reference (short of iterating our
-     * REFTAB). Which means we create a duplicate persistent ref every time we
-     * import a js object.
-     *
-     * To alleviate this, we inject a hidden property into JS objects which
-     * directly link to relevant userdata. This is done only if using
-     * extended Lua dialect which allows lua_pushuserdata. Double-wrapping
-     * overhead to make it work in standard would kill benefits of this hack
-     * in the first place.
-     */
     Local<String> idstr = NEWSTR(LV8_IDENTITY);
     Local<Value> identity = o->GetHiddenValue(idstr);
     if (!identity.IsEmpty() && !identity->IsUndefined()) {
@@ -284,9 +280,6 @@ static void convert_js2lua(lua_State *L, const Local<Value> &v)
     }
     lv8_object *obj = (lv8_object*)lua_newuserdata(L, sizeof(*obj));
     o->SetHiddenValue(idstr, External::New(ISOLATE, (void*)obj));
-#else
-    lv8_object *obj = (lv8_object*)lua_newuserdata(L, sizeof(*obj));
-#endif
     memset(obj, 0, sizeof(*obj));
     obj->object.Reset(ISOLATE, o); // Anchor until lv8_obj_gc kills it.
     lua_pushvalue(L, OBJMT); // Associate obj mt.
@@ -313,9 +306,6 @@ int lv8_create_context(struct lua_State *L)
   gl->SetAlignedPointerInInternalField(0, (void*)ctx);
   ctx->object.Reset(ISOLATE, gl);
   ctx->object.SetWeak(L, js_weak_object);
-//  ctx->object.MarkIndependent();
-  //ctx->object.MarkIndependent();
-  //persistent_add(L, lua_gettop(L), ctx); // Map udata.
   if (lua_gettop(L) > 1) { // Initializer?
     if (lua_istable(L, 1)) { // From table.
       c->Enter();
@@ -371,7 +361,6 @@ int lv8_create_sandbox(struct lua_State *L)
     gl->SetAlignedPointerInInternalField(0, (void*)ctx);
     ctx->object.Reset(ISOLATE, gl); // Intercept.
     ctx->object.SetWeak(L, js_weak_object);
-//    ctx->object.MarkIndependent();
   } else 
     luaL_argerror(L, 1, "sandbox proxy");
 
@@ -800,6 +789,7 @@ static int lv8_force_gc(lua_State *L)
   while (!v8::V8::IdleNotification());
 }
 
+/* ArrayBuffer allocator. */
 class lv8_ab_allocator : public ArrayBuffer::Allocator {
   public:
   virtual void* Allocate(size_t length) {
@@ -811,7 +801,6 @@ class lv8_ab_allocator : public ArrayBuffer::Allocator {
     return data;
   }
   virtual void Free(void* data, size_t length) {
-    printf("freeing\n");
     free(data);
   }
 };
@@ -884,10 +873,31 @@ int luaclose_lv8(lua_State *L)
   return 0;
 }
 
+#if LV8_NEED_FINHACK
+/* Trap size of userdata. */
+static lua_Alloc olda;
+static ptrdiff_t finhack = 0;
+static void *fakealloc(void *ud, void *ptr, size_t o, size_t n)
+{
+  if (n == 0)
+    return olda(ud, ptr, o, n);
+  finhack = n;
+  void *r = olda(ud, ptr, o, n);
+  return r;
+}
+#endif
+
 /* Lua and V8 states. */
 int luaopen_lv8(lua_State *L)
 {
   V8::SetFlagsFromString(LV8_DEFAULT_FLAGS, sizeof(LV8_DEFAULT_FLAGS)-1);
+#if LV8_NEED_FINHACK
+  void *ud;
+  olda = lua_getallocf(L, &ud);
+  lua_setallocf(L, fakealloc, ud);
+  assert(finhack);
+  lua_setallocf(L, olda, ud);
+#endif
   lua_settop(L, 0);
 
   /* Library lives at 1. */
@@ -898,6 +908,9 @@ int luaopen_lv8(lua_State *L)
   /* Globally shared state which holds our proxy template. */
   lv8_state *state = (lv8_state*) lua_newuserdata(L, sizeof(lv8_state));
   memset(state, 0, sizeof(*state));
+#if LV8_NEED_FINHACK
+  state->finhack = finhack;
+#endif
   lua_newtable(L); // State cleanup mt.
   lua_pushcfunction(L, luaclose_lv8);
   lua_setfield(L, -2, "__gc");

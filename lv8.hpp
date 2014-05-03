@@ -36,6 +36,7 @@ struct lv8_state {
   int initialized;
   v8::Persistent<v8::FunctionTemplate> proxy;
   v8::Persistent<v8::ObjectTemplate> gtpl;
+  ptrdiff_t finhack;
 };
 
 struct lv8_context : lv8_object {
