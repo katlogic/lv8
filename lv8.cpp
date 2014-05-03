@@ -43,6 +43,9 @@ using namespace v8;
 #endif
 #endif
 
+/* Default V8 engine flags. */
+#define LV8_DEFAULT_FLAGS "--harmony"
+
 /* Shortcut macros. */
 #define STATEUD lua_upvalueindex(1)
 #define REFTAB lua_upvalueindex(2)
@@ -114,16 +117,16 @@ static void persistent_add(lua_State *L, int idx, lv8_object *v)
 /* Last reference of Lua object released. */
 static int lv8_obj_gc(lua_State *L)
 {
-  lv8_context *o = (lv8_context*)lua_touserdata(L, 1);
+  HandleScope scope(ISOLATE);
+  lv8_object *o = (lv8_object*)lua_touserdata(L, 1);
   assert(o);
   lua_getmetatable(L, 1);
   assert(!lua_isnil(L, -1));
   if (lua_rawequal(L, -1, CTXMT)) {
-    o->context.Reset(); // Kill context if it is one.
+    /* NO-OP. *OREF(o) might be null if weak above triggered. */
   } else {
     assert(lua_rawequal(L, -1, OBJMT));
 #if LV8_CACHE_PERSISTENT
-    HandleScope scope(ISOLATE);
     OREF(o)->SetHiddenValue(NEWSTR(LV8_IDENTITY),
       Undefined(ISOLATE));
 #endif
@@ -138,19 +141,21 @@ js_weak_callback(const WeakCallbackData<v8::Object, lua_State> &data)
 {
   HandleScope scope(ISOLATE);
   Local<Object> o = data.GetValue();
-  lv8_object *v = (lv8_object*)o->GetAlignedPointerFromInternalField(0);
+  lv8_object *v;
   lua_State *L = data.GetParameter();
+  if (!PROXY->HasInstance(o)) // Resolve true object underneath proxy.
+    o = o->GetPrototype()->ToObject();
+  v = (lv8_object*)o->GetAlignedPointerFromInternalField(0);
 
   persistent_lookup_js(L, (lv8_object*)v); // Lookup Lua object.
 
 #ifndef NDEBUG
   if (lua_getmetatable(L, -1)) { // These should always short-circuit long before.
-    assert(!(lua_rawequal(L, -1, OBJMT) || lua_rawequal(L, -1, CTXMT)));
+    assert(!lua_rawequal(L, -1, OBJMT));
     lua_pop(L, 1);
   }
 #endif
 
-  printf("weak called! %p %d\n", v, lua_gettop(L), L);
   lua_pushnil(L);
   lua_rawset(L, REFTAB); // Clear Lua -> JS.
   lua_pushlightuserdata(L, (void*)v);
@@ -270,16 +275,16 @@ int lv8_create_context(struct lua_State *L)
 {
   HandleScope scope(ISOLATE);
   lv8_checkstate(L);
-  lv8_context *ctx = (lv8_context*)lua_newuserdata(L, sizeof(*ctx));
+  lv8_object *ctx = (lv8_object*)lua_newuserdata(L, sizeof(*ctx));
   memset(ctx, 0, sizeof(*ctx));
   lua_pushvalue(L, CTXMT); // Associate obj mt.
   lua_setmetatable(L, -2);
+
   Local<Context> c = Context::New(ISOLATE, 0, GTPL);
   Local<Object> glproxy = c->Global();
   Local<Object> gl = glproxy->GetPrototype()->ToObject();
   gl->SetAlignedPointerInInternalField(0, (void*)ctx);
-  ctx->context.Reset(ISOLATE, c);
-  ctx->object.Reset(ISOLATE, gl);
+  ctx->object.Reset(ISOLATE, glproxy);
   ctx->object.SetWeak(L, js_weak_callback);
   persistent_add(L, lua_gettop(L), ctx); // Map udata.
   if (lua_gettop(L) > 1) { // Initializer?
@@ -287,7 +292,7 @@ int lv8_create_context(struct lua_State *L)
       c->Enter();
       lua_pushnil(L);
       while (lua_next(L, 1)) { // Populate from table.
-        gl->Set(convert_lua2js(L, -2), convert_lua2js(L, -1));
+        glproxy->Set(convert_lua2js(L, -2), convert_lua2js(L, -1));
         lua_pop(L, 1); // Pop value, keep key for next.
       }
       c->Exit();
@@ -305,7 +310,7 @@ int lv8_create_context(struct lua_State *L)
           a->CreationContext()->Enter();
           Local<Value> val = init->Get(propname);
           a->CreationContext()->Exit();
-          gl->Set(propname, val);
+          glproxy->Set(propname, val);
         }
         c->Exit();
       }
@@ -325,16 +330,16 @@ int lv8_create_sandbox(struct lua_State *L)
   if (lua_gettop(L) >= 1) {
     lv8_checkstate(L);
     HandleScope scope(ISOLATE);
-    lv8_context *ctx = (lv8_context*)lua_newuserdata(L, sizeof(*ctx));
+    lv8_object *ctx = (lv8_object*)lua_newuserdata(L, sizeof(*ctx));
     memset(ctx, 0, sizeof(*ctx));
     lua_pushvalue(L, CTXMT); // Associate obj mt.
     lua_setmetatable(L, -2);
 
     Local<Context> c = Context::New(ISOLATE, 0, PROXY->InstanceTemplate());
-    ctx->context.Reset(ISOLATE, c);
+    Local<Object> glproxy = c->Global();
     Local<Object> gl = c->Global()->GetPrototype()->ToObject();
     gl->SetAlignedPointerInInternalField(0, (void*)ctx);
-    ctx->object.Reset(ISOLATE, gl); // Intercept.
+    ctx->object.Reset(ISOLATE, glproxy); // Intercept.
     ctx->object.SetWeak(L, js_weak_callback);
     persistent_add(L, 1, ctx);
   } else 
@@ -749,7 +754,18 @@ static int lv8_flags(lua_State *L)
 
 static int lv8_force_gc(lua_State *L)
 {
-  ISOLATE->RequestGarbageCollectionForTesting(Isolate::kFullGarbageCollection);
+  {
+    /* 
+     * V8 keeps one instace stale for fast reuse.
+     * Allocate dummy one to force flush.
+     */
+    Isolate *i = Isolate::GetCurrent();
+    HandleScope h(i);
+    Handle<Context> generic = Context::New(i);
+    Handle<Context> context = Context::New(i, 0, GTPL);
+    Handle<Context> sandbox = Context::New(i, 0, PROXY->InstanceTemplate());
+  }
+  while (!v8::V8::IdleNotification());
 }
 
 class lv8_ab_allocator : public ArrayBuffer::Allocator {
@@ -838,6 +854,7 @@ int luaclose_lv8(lua_State *L)
 /* Lua and V8 states. */
 int luaopen_lv8(lua_State *L)
 {
+  V8::SetFlagsFromString(LV8_DEFAULT_FLAGS, sizeof(LV8_DEFAULT_FLAGS)-1);
   lua_settop(L, 0);
 
   /* Library lives at 1. */
