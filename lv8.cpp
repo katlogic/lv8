@@ -62,6 +62,8 @@ using namespace v8;
 #define REF(t,v) Local<t>::New(ISOLATE, (v))
 #define ESCAPE(v) scope.Escape(LOCAL(v));
 #define NEWSTR(arg...) String::NewFromUtf8(ISOLATE, arg)
+#define LITERAL(s) \
+  String::NewFromUtf8(ISOLATE, s, String::kInternalizedString, sizeof(s)-1)
 
 /*
  * Notes on how GC works:
@@ -192,7 +194,7 @@ static int lv8_obj_gc(lua_State *L)
     } // NO-OP. *OREF(o) might be null if it was weak already.
   } else { // Kill the cache.
     assert(lua_rawequal(L, -1, OBJMT));
-    OREF(o)->SetHiddenValue(NEWSTR(LV8_IDENTITY),
+    OREF(o)->SetHiddenValue(LITERAL(LV8_IDENTITY),
       Undefined(ISOLATE));
   }
   o->object.Reset();
@@ -216,7 +218,7 @@ static Local<Value> convert_lua2js(lua_State *L, int idx)
     case LUA_TSTRING: {
       size_t n;
       const char *p = lua_tolstring(L, idx, &n);
-      return ESCAPE(NEWSTR(p, String::kInternalizedString, (int)n));
+      return ESCAPE(NEWSTR(p, String::kNormalString, (int)n));
     }
   }
   lv8_object *wrapper = (lv8_object*)lua_touserdata(L, idx);
@@ -259,7 +261,7 @@ static void convert_js2lua(lua_State *L, const Local<Value> &v)
   } else { // Must be some sort of other object.
     assert(v->IsObject());
     Local<Object> o = v->ToObject();
-    Local<String> idstr = NEWSTR(LV8_IDENTITY);
+    Local<String> idstr = LITERAL(LV8_IDENTITY);
     lv8_context *c;
 
     if (PROXY->HasInstance(v)) { // (LIKELY) Proxied?
@@ -412,8 +414,8 @@ static int lv8_obj_lua2js_call(lua_State *L)
     Local<Value> res = o->CallAsFunction(receiver, argc, argv);
     if (exc.HasCaught()) {
       Local<Object> eo = exc.Exception()->ToObject();
-      luaL_traceback(L, L, *String::Utf8Value(eo->Get(NEWSTR("stack"))), 1);
-      eo->Set(NEWSTR("traceback"), convert_lua2js(L, -1));
+      luaL_traceback(L, L, *String::Utf8Value(eo->Get(LITERAL("stack"))), 1);
+      eo->Set(LITERAL("traceback"), convert_lua2js(L, -1));
       lua_pop(L, 1);
       convert_js2lua(L, eo);
       caught = 1;
@@ -448,8 +450,8 @@ int lv8_create_instance(lua_State *L)
     Local<Value> res = o->CallAsConstructor(argc, argv);
     if (exc.HasCaught()) {
       Local<Object> eo = exc.Exception()->ToObject();
-      luaL_traceback(L, L, *String::Utf8Value(eo->Get(NEWSTR("stack"))), 1);
-      eo->Set(NEWSTR("traceback"), convert_lua2js(L, -1));
+      luaL_traceback(L, L, *String::Utf8Value(eo->Get(LITERAL("stack"))), 1);
+      eo->Set(LITERAL("traceback"), convert_lua2js(L, -1));
       lua_pop(L, 1);
       convert_js2lua(L, eo);
       caught = 1;
@@ -495,7 +497,7 @@ static int lv8_obj_tostring(lua_State *L)
     }
   } else {
     if (o->IsNativeError()) {
-      Local<Object> tb = o->Get(NEWSTR("traceback"))->ToObject();
+      Local<Object> tb = o->Get(LITERAL("traceback"))->ToObject();
       if (!tb.IsEmpty()) {
         lua_pushfstring(L,*String::Utf8Value(tb));
         ctx->Exit();
@@ -586,7 +588,7 @@ static int lv8_obj_pairs(lua_State *L)
 static int lv8_obj_len(lua_State *L)
 {
   CB_LUA_COMMON;
-  convert_js2lua(L, o->Get(NEWSTR("length")));
+  convert_js2lua(L, o->Get(LITERAL("length")));
   ctx->Exit();
   return 1;
 }
@@ -732,7 +734,7 @@ static void lv8_enumprop_cb(const PropertyCallbackInfo<Array> &info)
   convert_js2lua(L, info.Holder()); // Load table
   if (!lua_istable(L, -1)) {
     lua_pop(L, 1);
-    ISOLATE->ThrowException(NEWSTR("Only lua tables can be enumerated"));
+    ISOLATE->ThrowException(LITERAL("Only lua tables can be enumerated"));
   }
   uint32_t i, n = 0; // Slower: lua_rawlen(L -1);
   Local<Array> a = Array::New(ISOLATE, n);
@@ -833,7 +835,7 @@ static void lv8_checkstate(lua_State *L)
     state->gtpl.Reset(ISOLATE, gtpl);
 
 #if LV8_FS_API
-    gtpl->Set(NEWSTR("llfs"), lv8_fs_init());
+    gtpl->Set(LITERAL("llfs"), lv8_fs_init());
 #endif
 
     Local<FunctionTemplate> proxy =
