@@ -35,9 +35,9 @@
 
 using namespace v8;
 
-/* lua_pushuserdata() is needed for Persistent<> caching. */
+/* lua_pushuserdata(). */
 #define LV8_IDENTITY "lv8::identity"
-#define LV8_NEED_FINHACK 1
+#define LV8_NEED_FINHACK ((LUA_VERSION_NUM<503) || defined(LUA_VERSION_LJX))
 #ifndef lua_pushuserdata
 #include "pudata/pudata.h"
 #else
@@ -77,13 +77,12 @@ using namespace v8;
  * both for fast lookups and as an anchor. The JS proxies are weak
  * and js_weak_callback is called when there are no more references
  * in JS. This kills the REFTAB anchor in turn (and eventually
- * allows Lua to GC).
+ * allows Lua to GC). Note that this anchoring is the dreaded
+ * object resurrection by finalizer, a feature of Lua 5.3, for Lua 5.2
+ * it had to be hacked in (LV8_NEED_FINHACK). For LuaJIT, use LJX.
  *
  * In general, accessing Lua objects from JS is faster than
  * the opposite (V8 is not very well cut for efficient embedding).
- *
- * Circular dependencies are prevented by short-circuiting proxies
- * on both sides (convert_lua2js|js2_lua).
  */
 
 /* Find JS object associated with Lua value. */
@@ -181,7 +180,7 @@ static int lv8_obj_gc(lua_State *L)
   lua_getmetatable(L, 1);
   assert(!lua_isnil(L, -1));
   if (lua_rawequal(L, -1, CTXMT)) {
-    if (!o->jscollected) { // Not already collected context?
+    if (!o->jscollected && !o->resurrected) { // Not already collected context?
       lv8_restart_finalizer(L, (void*)o);
       lua_pushuserdata_resurrect(L, 1);
       lua_pushvalue(L, CTXMT);
@@ -191,7 +190,7 @@ static int lv8_obj_gc(lua_State *L)
       o->resurrected = 1;
       return 0;
     } // NO-OP. *OREF(o) might be null if it was weak already.
-  } else {
+  } else { // Kill the cache.
     assert(lua_rawequal(L, -1, OBJMT));
     OREF(o)->SetHiddenValue(NEWSTR(LV8_IDENTITY),
       Undefined(ISOLATE));
@@ -258,32 +257,47 @@ static void convert_js2lua(lua_State *L, const Local<Value> &v)
     String::Utf8Value str(v);
     lua_pushlstring(L, *str, str.length());
   } else { // Must be some sort of other object.
+    assert(v->IsObject());
     Local<Object> o = v->ToObject();
-    if (PROXY->HasInstance(v) || // Is it a sandbox or context?
-        o->CreationContext()->Global()->GetPrototype()->ToObject() == o) {
-      lv8_context *c = (lv8_context*)o->GetAlignedPointerFromInternalField(0);
-      assert(!c->jscollected); // Must not be past weak_context.
-      if (c->resurrected) { // Caught mid-gc phase.
-        c->context.ClearWeak();
-        lua_pushuserdata(L, (void*)c);
-        persistent_del(L, c); // Undo resurrection.
-        c->resurrected = 0;
-      }
-      lua_pushuserdata(L, (void*)c);
-      return; // Unwrapped context object.
-    }
     Local<String> idstr = NEWSTR(LV8_IDENTITY);
-    Local<Value> identity = o->GetHiddenValue(idstr);
-    if (!identity.IsEmpty() && !identity->IsUndefined()) {
-      lua_pushuserdata(L, External::Cast(*identity)->Value());
-      return; // Already wrapped JS object.
+    lv8_context *c;
+
+    if (PROXY->HasInstance(v)) { // (LIKELY) Proxied?
+      c = (lv8_context*)o->GetAlignedPointerFromInternalField(0);
+      lua_pushuserdata(L, c);
+      assert(!lua_isnil(L, -1));
+      if (!lua_getmetatable(L, -1)) { // (LIKELY) Lua Object proxy.  {
+        lua_pop(L, 1); // Pop udata.
+        persistent_lookup_js(L, c); // Get the Lua object.
+        return; // Return the actual lua object.
+      }
+      assert(lua_rawequal(L, -1, CTXMT));
+      lua_pop(L, 1); // Pop meta.
+    } else { // (UNLIKELY) Not proxied, might be context or JS value.
+      if (o->CreationContext()->Global()->GetPrototype()->ToObject() != o) {
+        Local<Value> identity = o->GetHiddenValue(idstr);
+        if (!identity.IsEmpty() && !identity->IsUndefined()) {
+          lua_pushuserdata(L, External::Cast(*identity)->Value());
+          return;
+        } // Cached udata exists.
+        lv8_object *obj = (lv8_object*)lua_newuserdata(L, sizeof(*obj));
+        o->SetHiddenValue(idstr, External::New(ISOLATE, (void*)obj));
+        memset(obj, 0, sizeof(*obj));
+        obj->object.Reset(ISOLATE, o); // Anchor until lv8_obj_gc kills it.
+        lua_pushvalue(L, OBJMT); // Associate obj mt.
+        lua_setmetatable(L, -2);
+        return; // New proxy created.
+      } // Otherwise it is a context.
+      c = (lv8_context*)o->GetAlignedPointerFromInternalField(0);
+      lua_pushuserdata(L, c);
     }
-    lv8_object *obj = (lv8_object*)lua_newuserdata(L, sizeof(*obj));
-    o->SetHiddenValue(idstr, External::New(ISOLATE, (void*)obj));
-    memset(obj, 0, sizeof(*obj));
-    obj->object.Reset(ISOLATE, o); // Anchor until lv8_obj_gc kills it.
-    lua_pushvalue(L, OBJMT); // Associate obj mt.
-    lua_setmetatable(L, -2);
+    assert(!c->jscollected); // Must not be past weak_context.
+    if (!c->resurrected) return; // Just return the pudata value.
+    c->context.ClearWeak(); // Caught mid-gc phase.
+    lua_pushvalue(L, -1); // Dup for persistent_del.
+    persistent_del(L, c); // Undo resurrection.
+    c->resurrected = 0;
+    return; // Unwrapped context object.
   }
 }
 
@@ -895,6 +909,7 @@ int luaopen_lv8(lua_State *L)
   void *ud;
   olda = lua_getallocf(L, &ud);
   lua_setallocf(L, fakealloc, ud);
+  lua_newuserdata_old(L, 0);
   assert(finhack);
   lua_setallocf(L, olda, ud);
 #endif

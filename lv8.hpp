@@ -41,8 +41,8 @@ struct lv8_state {
 
 struct lv8_context : lv8_object {
   v8::Persistent<v8::Context> context;
-  unsigned jscollected:1;
-  unsigned resurrected:1;
+  unsigned jscollected;
+  unsigned resurrected;
 };
 
 v8::Local<v8::ObjectTemplate> lv8_fs_init();
