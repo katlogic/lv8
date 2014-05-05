@@ -121,7 +121,7 @@ static void *get_buf(Handle<Object> b, int32_t off)
 #define ABUF(n) get_buf(info[n]->ToObject(), 0)
 #define ABUFP(n, off) get_buf(info[n]->ToObject(), AINT(off))
 
-static const char *lv8_strerrno(int err)
+static const char *mini_strerrno(int err)
 {
   static char errbuf[4096];
   const char *errsym = errbuf;
@@ -136,13 +136,13 @@ static const char *lv8_strerrno(int err)
   return errsym;
 }
 
-static void lv8_errno(const v8::FunctionCallbackInfo<Value> &info,
+static void do_errno(const v8::FunctionCallbackInfo<Value> &info,
     const char *name)
 {
   int err = errno;
   HandleScope scope(ISOLATE);
   Local<Object> self = info.This()->ToObject();
-  const char *errsym = lv8_strerrno(err);
+  const char *errsym = mini_strerrno(err);
   self->Set(NEWSTR("errcode"), Int32::New(ISOLATE, err));
   self->Set(NEWSTR("errsym"), NEWSTR(errsym));
   self->Set(NEWSTR("errstr"), NEWSTR(strerror(err)));
@@ -153,14 +153,14 @@ static void lv8_errno(const v8::FunctionCallbackInfo<Value> &info,
 #define FS_AFTER
 #define FS_RET info.GetReturnValue().Set(Int32::New(i, ret));
 #define FS(n, args...) \
-  static void lv8_fs_##n(const v8::FunctionCallbackInfo<Value> &info) { \
+  static void fs_##n(const v8::FunctionCallbackInfo<Value> &info) { \
     Isolate *i = ISOLATE; \
     HandleScope scope(i); \
     Local<Object> self = info.This()->ToObject(); \
     FS_BEFORE \
     ret = n(args); \
     if (ret < 0) \
-      lv8_errno(info, #n); \
+      do_errno(info, #n); \
     else { \
       FS_AFTER \
     } \
@@ -224,14 +224,14 @@ FS(lstat, ASTR(0), &st)
 FS(fstat, AINT(0), &st)
 
 /* Return string of computed realpath (or undefined on error). */
-static void lv8_fs_realpath(const v8::FunctionCallbackInfo<Value> &info) {
+static void fs_realpath(const v8::FunctionCallbackInfo<Value> &info) {
   Isolate *i = ISOLATE;
   HandleScope scope(i);
   Local<Object> self = info.This()->ToObject();
   char buf[PATH_MAX+1];
   char *ret = realpath(ASTR(0), buf);
   if (!ret) {
-    lv8_errno(info, "realpath");
+    do_errno(info, "realpath");
     info.GetReturnValue().Set(Undefined(ISOLATE));
   } else {
     info.GetReturnValue().Set(NEWSTR(buf));
@@ -239,14 +239,14 @@ static void lv8_fs_realpath(const v8::FunctionCallbackInfo<Value> &info) {
 }
 
 /* Return array of directory entries, '.' and '.. excluded. */
-static void lv8_fs_readdir(const v8::FunctionCallbackInfo<Value> &info) {
+static void fs_readdir(const v8::FunctionCallbackInfo<Value> &info) {
   Isolate *i = ISOLATE;
   HandleScope scope(i);
   Local<Object> self = info.This()->ToObject();
   char buf[PATH_MAX+1];
   DIR *d = opendir(ASTR(0));
   if (!d) {
-    lv8_errno(info, "readdir");
+    do_errno(info, "readdir");
     info.GetReturnValue().Set(Undefined(ISOLATE)); // Undefined on error.
   } else {
     Local<Array> ents = Array::New(i);
@@ -279,7 +279,7 @@ Local<ObjectTemplate> lv8_fs_init()
 {
   EscapableHandleScope scope(ISOLATE);
   Local<ObjectTemplate> fs = ObjectTemplate::New();
-#define FS_EXPORT(n) fs->Set(NEWSTR(#n), FunctionTemplate::New(ISOLATE, lv8_fs_##n));
+#define FS_EXPORT(n) fs->Set(NEWSTR(#n), FunctionTemplate::New(ISOLATE, fs_##n));
   FS_IMPLEMENTS(FS_EXPORT) // Define FS api.
 #define FS_CONST(n) fs->Set(NEWSTR(#n), Int32::New(ISOLATE, n));
   DEF_ERR(FS_CONST)

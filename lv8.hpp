@@ -47,8 +47,8 @@ struct lv8_context : lv8_object {
 
 /* Public C++ API */
 v8::Local<v8::ObjectTemplate> lv8_fs_init();
-int lv8_sandbox_factory(lua_State *L);
-int lv8_context_factory(lua_State *L,
-    v8::Handle<v8::Object> initjs = v8::Handle<v8::Object>(), int initlua = 0);
 void lv8_wrap_js2lua(lua_State *L, v8::Handle<v8::Object> o);
+lv8_context *lv8_unwrap(lua_State *L, int idx);
+bool lv8_shallow_copy(lua_State *L, v8::Handle<v8::Object> dst, v8::Handle<v8::Object> o);
+bool lv8_shallow_copy_from_lua(lua_State *L, v8::Handle<v8::Object> dst, int idx);
 

@@ -67,6 +67,12 @@ using namespace v8;
 #define UTF8(arg...) String::NewFromUtf8(ISOLATE, arg)
 #define LITERAL(s) \
   String::NewFromUtf8(ISOLATE, s, String::kInternalizedString, sizeof(s)-1)
+#define JS_DEFUN(tab, name, fn, data) \
+  tab->Set(LITERAL(name), \
+      FunctionTemplate::New(ISOLATE, fn, External::New(ISOLATE, data)))
+#define UNWRAP_L \
+  lua_State *L = (lua_State*)External::Cast(*info.Data())->Value()
+
 
 /*
  * Notes on how GC works:
@@ -266,6 +272,42 @@ void lv8_wrap_js2lua(lua_State *L, Handle<Object> o)
   lua_setmetatable(L, -2);
 }
 
+/* Query if given JS object is a proxy for actual Lua object
+ * or sandbox (but not context!). */
+bool lv8_is_lua_object(lua_State *L, Handle<Object> o)
+{
+  return PROXY->HasInstance(o);
+}
+
+/* 
+ * Given the Lua object (lv8_is_lua_object) return whether:
+ *  false - it is regular Lua data
+ *  true - the object is JS sandbox object (ie userdata)
+ * In any case, the actual Lua value is pushed on stack.
+ */
+bool lv8_is_js_sandbox(lua_State *L, Handle<Object> o, lv8_context **cp = 0)
+{
+  assert(lv8_is_lua_object(L, o));
+  lv8_context *c = (lv8_context*)o->GetAlignedPointerFromInternalField(0);
+  if (cp) *cp = c;
+  lua_pushuserdata(L, c);
+  assert(!lua_isnil(L, -1));
+  if (!lua_getmetatable(L, -1)) { // (LIKELY) Lua Object proxy.  {
+    lua_pop(L, 1); // Pop udata.
+    persistent_lookup_js(L, c); // Get the Lua object.
+    return false; // Return the actual lua object.
+  }
+  assert(lua_rawequal(L, -1, UV_CTXMT));
+  lua_pop(L, 1); // Pop meta.
+  return true; // It is a sandbox.
+}
+
+/* Check if object o is a context object (ie not sandbox). */
+bool lv8_is_js_context(Handle<Object> o)
+{
+  return o->CreationContext()->Global()->GetPrototype()->ToObject() == o;
+}
+
 /* Convert JS value to Lua counterpart. */
 static void convert_js2lua(lua_State *L, const Handle<Value> &v)
 {
@@ -283,22 +325,13 @@ static void convert_js2lua(lua_State *L, const Handle<Value> &v)
     assert(v->IsObject());
     Handle<Object> o = v->ToObject();
     lv8_context *c;
-
-    if (PROXY->HasInstance(v)) { // (LIKELY) Proxied?
-      c = (lv8_context*)o->GetAlignedPointerFromInternalField(0);
-      lua_pushuserdata(L, c);
-      assert(!lua_isnil(L, -1));
-      if (!lua_getmetatable(L, -1)) { // (LIKELY) Lua Object proxy.  {
-        lua_pop(L, 1); // Pop udata.
-        persistent_lookup_js(L, c); // Get the Lua object.
-        return; // Return the actual lua object.
-      }
-      assert(lua_rawequal(L, -1, UV_CTXMT));
-      lua_pop(L, 1); // Pop meta.
+    if (lv8_is_lua_object(L, o)) { // (LIKELY) Proxied?
+      if (!lv8_is_js_sandbox(L, o, &c))
+        return; // Return native Lua object.
     } else { // (UNLIKELY) Not proxied, might be context or JS value.
-      if (o->CreationContext()->Global()->GetPrototype()->ToObject() != o) {
+      if (!lv8_is_js_context(o)) {
         lv8_wrap_js2lua(L, o);
-        return; // Return proxy (new or cached).
+        return; // Return JS object proxy (new or cached).
       } // Otherwise it is a context.
       c = (lv8_context*)o->GetAlignedPointerFromInternalField(0);
       lua_pushuserdata(L, c);
@@ -315,9 +348,64 @@ static void convert_js2lua(lua_State *L, const Handle<Value> &v)
 
 static void checkstate(lua_State *L);
 
+/* Copy attributes of o to dst. */
+bool lv8_shallow_copy(lua_State *L, Handle<Object> dst, Handle<Object> o)
+{
+  HandleScope scope(ISOLATE);
+  if (o.IsEmpty() || o->IsUndefined() || !o->IsObject())
+    return false;
+  if (lv8_is_lua_object(L, o)) { // Sandbox or proxy for Lua object
+    if (!lv8_is_js_sandbox(L, o)) { // It is a Lua native.
+      bool res = lv8_shallow_copy_from_lua(L, dst, -1); // Copy it
+      lua_pop(L, 1);
+      return res;
+    }
+    lua_pop(L, 1); // Pop the sandbox object on stack.
+  }
+  Handle<Array> a = o->GetPropertyNames();
+  uint32_t n = a->Length();
+  for (uint32_t i = 0; i < n; i++) {
+    Handle<Value> propname = a->Get(i);
+    a->CreationContext()->Enter();
+    Handle<Value> val = o->Get(propname);
+    a->CreationContext()->Exit();
+    dst->Set(propname, val);
+  }
+}
+
+/* Check if given object at idx is wrapped (context, js object etc). */
+lv8_context *lv8_unwrap(lua_State *L, int idx)
+{
+  if (lua_getmetatable(L, idx)) {
+    if (lua_rawequal(L, -1, UV_CTXMT) || lua_rawequal(L, -1, UV_OBJMT)) {
+      lua_pop(L, 1);
+      return (lv8_context*)lua_touserdata(L, idx);
+    }
+    lua_pop(L, 1);
+  }
+  return 0;
+}
+
+/* Copy fields of lua table at idx to dst. */
+bool lv8_shallow_copy_from_lua(lua_State *L, Handle<Object> dst, int idx)
+{
+  if (!lua_istable(L, idx)) {
+    if (lv8_object *o = lv8_unwrap(L, idx)) {
+      lv8_shallow_copy(L, dst, OREF(o));
+      return true; // Succesfuly unwrapped.
+    }
+    return false;
+  }
+  lua_pushnil(L);
+  while (lua_next(L, idx)) { // Populate from table.
+    dst->Set(convert_lua2js(L, -2), convert_lua2js(L, -1));
+    lua_pop(L, 1); // Pop value, keep key for next.
+  }
+  return true;
+}
+
 /* Context factory common to Lua and JS callers. */
-int lv8_context_factory(struct lua_State *L,
-    Handle<Object> initjs, int initlua)
+lv8_context *lv8_context_factory(struct lua_State *L)
 {
   checkstate(L);
   HandleScope scope(ISOLATE);
@@ -334,41 +422,17 @@ int lv8_context_factory(struct lua_State *L,
   ctx->object.Reset(ISOLATE, gl);
   ctx->object.SetWeak(L, js_weak_object);
 
-  c->Enter();
-  if (initlua) { // Init from Lua table.
-    lua_pushnil(L);
-    while (lua_next(L, 1)) { // Populate from table.
-      glproxy->Set(convert_lua2js(L, -2), convert_lua2js(L, -1));
-      lua_pop(L, 1); // Pop value, keep key for next.
-    }
-  }
-
-  if (!initjs.IsEmpty()) { // Init from JS object.
-    Handle<Array> a = initjs->GetPropertyNames();
-    uint32_t n = a->Length();
-    for (uint32_t i = 0; i < n; i++) {
-      Handle<Value> propname = a->Get(i);
-      a->CreationContext()->Enter();
-      Handle<Value> val = initjs->Get(propname);
-      a->CreationContext()->Exit();
-      glproxy->Set(propname, val);
-    }
-  }
-  c->Exit();
-  return 1;
+  return ctx;
 }
 
 /* Construct new JS context. */
 int lv8_create_context(struct lua_State *L)
 {
   HandleScope scope(ISOLATE);
-  if (lua_istable(L, 1)) { // From table.
-    return lv8_context_factory(L, Handle<Object>(), 1);
-  } else if (lv8_object *o = (lv8_object*)lua_touserdata(L, 1)) {
-    if (lua_rawequal(L, -1, UV_CTXMT) || lua_rawequal(L, -1, UV_OBJMT))
-      return lv8_context_factory(L, OREF(o), 0);
-  }
-  return lv8_context_factory(L);
+  lv8_object *ctx = lv8_context_factory(L);
+  if (lua_gettop(L) > 1)
+    lv8_shallow_copy_from_lua(L, OREF(ctx), 1);
+  return 1;
 }
 
 /* Wrapper for lv8 table __call. */
@@ -378,7 +442,7 @@ static int lua_create_context_call(struct lua_State *L) {
 }
 
 /* Common sandbox factory for JS and Lua. */
-int lv8_sandbox_factory(lua_State *L)
+lv8_context *lv8_sandbox_factory(lua_State *L)
 {
     checkstate(L);
     HandleScope scope(ISOLATE);
@@ -400,7 +464,8 @@ int lv8_sandbox_factory(lua_State *L)
 int lv8_create_sandbox(struct lua_State *L)
 {
   luaL_checkany(L, 1);
-  return lv8_sandbox_factory(L);
+  lv8_sandbox_factory(L);
+  return 1;
 }
 
 /* Common context header. */
@@ -653,10 +718,6 @@ static bool exception(lua_State *L, int narg, int nret)
   return true;
 }
 
-/* Load L callback argument. */
-#define UNWRAP_L \
-  lua_State *L = (lua_State*)External::Cast(*info.Data())->Value()
-
 /* Get holder[idx]. */
 static void lv8_getidx_cb(uint32_t idx,
     const PropertyCallbackInfo<Value> &info)
@@ -797,6 +858,25 @@ static void lv8_js2lua_call(const v8::FunctionCallbackInfo<Value> &info)
   lua_pop(L, nres);
 }
 
+/* Eval a string (with explicit context or default one). */
+static void js_vm_eval(const v8::FunctionCallbackInfo<Value> &info) {
+  UNWRAP_L;
+}
+
+/* Construct a JS context. */
+static void js_vm_context(const v8::FunctionCallbackInfo<Value> &info) {
+  UNWRAP_L;
+//  info.GetReturnValue().Set(convert_lua2js(L, lua_gettop(L)));
+  lua_pop(L, 1);
+}
+
+static void js_vm_sandbox(const v8::FunctionCallbackInfo<Value> &info) {
+  UNWRAP_L;
+//  info.GetReturnValue().Set(conver_lua2js(L, lua_gettop(L)));
+  lua_pop(L, 1);
+}
+
+
 /* Configure V8 flags. */
 static int lua_v8_flags(lua_State *L)
 {
@@ -843,15 +923,13 @@ class ab_allocator : public ArrayBuffer::Allocator {
 };
 
 /* JavaScript raw vm.* API subtable. */
-Handle<ObjectTemplate> lv8_vm_init()
+Handle<ObjectTemplate> static lv8_vm_init(lua_State *L)
 {
   EscapableHandleScope scope(ISOLATE);
   Local<ObjectTemplate> vm = ObjectTemplate::New();
-#if 0
-  vm->Set(LITERAL("eval", js_vm_eval)); // Execute
-  vm->Set(LITERAL("context", js_vm_context)); // Create context
-  vm->Set(LITERAL("sandbox", js_vm_sandbox)); // Create sandbox
-#endif
+  JS_DEFUN(vm, "eval", js_vm_eval, L); // Execute.
+  JS_DEFUN(vm, "context", js_vm_eval, L); // Create context.
+  JS_DEFUN(vm, "sandbox", js_vm_eval, L); // Create sandbox.
   return scope.Escape(vm);
 }
 
@@ -891,7 +969,7 @@ static void checkstate(lua_State *L)
     lv8_wrap_js2lua(L, lv8_fs_init()->NewInstance());
     lua_setfield(L, -2, "fs");
 #endif
-    lv8_wrap_js2lua(L, lv8_vm_init()->NewInstance());
+    lv8_wrap_js2lua(L, lv8_vm_init(L)->NewInstance());
     lua_setfield(L, -2, "vm");
     tmp->Exit();
   }
