@@ -126,7 +126,7 @@ static const char *mini_strerrno(int err)
   static char errbuf[4096];
   const char *errsym = errbuf;
 #define SELECT_ERRSYM(e) \
-  case e: errsym = #e;
+  case e: errsym = #e; break;
 
   switch (err) {
     DEF_ERR(SELECT_ERRSYM)

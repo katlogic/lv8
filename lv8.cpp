@@ -427,15 +427,16 @@ static int lua_obj_tostring(lua_State *L)
   if (lv8_unwrap_lua(L, 1)) {
     if (p->type == LV8_OBJ_JS) {
       if (o->IsNativeError()) {
-        Handle<Object> tb = o->Get(LITERAL("traceback"))->ToObject();
-        if (!tb.IsEmpty()) {
-          lua_pushfstring(L,*String::Utf8Value(tb));
+        Handle<Value> tb = o->Get(LITERAL("traceback"));
+        if (!tb.IsEmpty() && !tb->IsUndefined()) {
+          lua_pushfstring(L,*String::Utf8Value(tb->ToString()));
         } else {
-          lua_pushstring(L, "ERROR TBD no traceback");
+          Handle<String> tb = o->Get(LITERAL("stack"))->ToString();
+          lua_pushfstring(L,*String::Utf8Value(tb));
         }
       } else {
-        lua_pushfstring(L, "js<%s>: %p",
-              *String::Utf8Value(o->GetConstructorName()), *o);
+        lua_pushfstring(L, "js<%s>: ud=%p *o=%p",
+              *String::Utf8Value(o->GetConstructorName()), p, *o);
       }
     } else if (p->type == LV8_OBJ_CTX) {
       lua_pushfstring(L,"js<*context>: %p", p);
