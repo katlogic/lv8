@@ -31,11 +31,11 @@
 #include <lua.h>
 #include <lauxlib.h>
 
-LV8_EXTERN int luaopen_lv8(lua_State *L);
-LV8_EXTERN int luaclose_lv8(lua_State *L);
-LV8_EXTERN int lv8_create_context(lua_State *L);
-LV8_EXTERN int lv8_create_sandbox(lua_State *L);
-LV8_EXTERN int lv8_create_instance(lua_State *L);
+/* Public C api. */
+LV8_EXTERN int luaopen_lv8(struct lua_State *L);
+LV8_EXTERN int luaclose_lv8(struct lua_State *L);
+LV8_EXTERN int lv8_create_instance(struct lua_State *L);
+LV8_EXTERN int lv8_create_instance(struct lua_State *L);
 
 #undef LV8_EXTERN
 
