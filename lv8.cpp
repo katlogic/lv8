@@ -167,6 +167,12 @@ js_weak_context(const WeakCallbackData<Context, lua_State> &data)
   HandleScope scope(ISOLATE);
   Handle<Object> o = data.GetValue()->Global()->GetPrototype()->ToObject();
   lv8_context *v = (lv8_context*)o->GetAlignedPointerFromInternalField(0);
+  lua_State *L = data.GetParameter();
+
+  lua_pushuserdata(L, v); // Remove anchor if there is one.
+  lua_pushnil(L);
+  lua_rawset(L, UV_REFTAB);
+
   v->context.Reset(); // This should trigger object collection below
   v->object.Reset();
   v->jscollected = 1;
