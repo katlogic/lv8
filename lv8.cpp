@@ -37,7 +37,7 @@ using namespace v8;
 
 /* lua_pushuserdata(). */
 #define LV8_IDENTITY "lv8::identity"
-#define LV8_NEED_FINHACK ((LUA_VERSION_NUM<503) || defined(LUA_VERSION_LJX))
+#define LV8_NEED_FINHACK ((LUA_VERSION_NUM<503) && !defined(LUA_VERSION_LJX))
 #ifndef lua_pushuserdata
 #include "pudata/pudata.h"
 #else
@@ -283,7 +283,6 @@ static Handle<Value> convert_lua2js(lua_State *L, int idx)
       wrapper->object.SetWeak(L, js_weak_object);
     }
   }
-unwrap:;
   return scope.Escape(Local<Object>::New(ISOLATE, wrapper->object));
 }
 
@@ -302,11 +301,10 @@ static void convert_js2lua(lua_State *L, const Handle<Value> &v,
     String::Utf8Value str(v);
     lua_pushlstring(L, *str, str.length());
   } else { // Must be some sort of other object.
-    bool sandbox = false;
     assert(v->IsObject());
     Handle<Object> o = v->ToObject();
     lv8_context *c;
-    if (c = lv8_unwrap_js(L, o)) { // (LIKELY) Proxied?
+    if ((c = lv8_unwrap_js(L, o))) { // (LIKELY) Proxied?
       if (c->type == LV8_OBJ_LUA) {
         persistent_lookup_js(L, c);
         return; // Return native Lua object.
@@ -479,7 +477,6 @@ static int lua_obj_ipairs(lua_State *L)
     if (!o->IsArray()) {
       err = 1;
     } else {
-      Handle<Array> a = Handle<Array>::Cast(o);
       lua_pushcfunction(L, js_array_ipairs_aux);
       lua_pushvalue(L, 1);
       lua_pushnil(L);
@@ -488,6 +485,7 @@ static int lua_obj_ipairs(lua_State *L)
   }
   if (err)
     luaL_error(L, "Only JS Array() can be used with ipairs()");
+  return 0;
 }
 
 /* Just call next(). JS object has been turned into table beforehand. */
@@ -703,7 +701,7 @@ static void lv8_js2lua_call(const v8::FunctionCallbackInfo<Value> &info)
     return; // Propagate exception.
   }
 
-  int nres = lua_gettop(L) - top; // Convert output results.
+  uint32_t nres = lua_gettop(L) - top; // Convert output results.
   Handle<Array> array = Array::New(ISOLATE, nres);
   for (uint32_t i = 0; i < nres; i++)
     array->Set(i, convert_lua2js(L, top + i + 1));
@@ -727,18 +725,8 @@ static int lua_v8_flags(lua_State *L)
 /* Attempt to force GC cycle (still unreliable). */
 static int lua_force_gc(lua_State *L)
 {
-  {
-    /* 
-     * V8 keeps one instace stale for fast reuse.
-     * Allocate dummy one to force flush.
-     */
-    Isolate *i = Isolate::GetCurrent();
-    HandleScope h(i);
-    Handle<Context> generic = Context::New(i);
-    Handle<Context> context = Context::New(i, 0, GLOBAL);
-    Handle<Context> sandbox = Context::New(i, 0, PROXY->InstanceTemplate());
-  }
   while (!v8::V8::IdleNotification());
+  return 0;
 }
 
 /* ArrayBuffer allocator. */
@@ -817,8 +805,8 @@ Handle<ObjectTemplate> static lv8_vm_init(lua_State *L)
   EscapableHandleScope scope(ISOLATE);
   Local<ObjectTemplate> vm = ObjectTemplate::New();
   JS_DEFUN(vm, "eval", js_vm_eval, L); // Execute.
-  JS_DEFUN(vm, "context", js_vm_eval, L); // Create context.
-  JS_DEFUN(vm, "sandbox", js_vm_eval, L); // Create sandbox.
+  JS_DEFUN(vm, "context", js_vm_context, L); // Create context.
+  JS_DEFUN(vm, "sandbox", js_vm_sandbox, L); // Create sandbox.
   return scope.Escape(vm);
 }
 
@@ -983,6 +971,7 @@ bool lv8_shallow_copy(lua_State *L, Handle<Object> dst, Handle<Object> o)
     a->CreationContext()->Exit();
     dst->Set(propname, val);
   }
+  return true;
 }
 
 /* Check if given object at idx is wrapped (context, js object etc). */
@@ -1005,8 +994,7 @@ bool lv8_shallow_copy_from_lua(lua_State *L, Handle<Object> dst, int idx)
 {
   if (!lua_istable(L, idx)) {
     if (lv8_object *o = lv8_unwrap_lua(L, idx)) {
-      lv8_shallow_copy(L, dst, OREF(o));
-      return true; // Succesfuly unwrapped.
+      return lv8_shallow_copy(L, dst, OREF(o));
     }
     return false;
   }
@@ -1071,7 +1059,6 @@ lv8_context *lv8_sandbox_factory(lua_State *L, int idx)
 
     Handle<Context> c = Context::New(ISOLATE, 0, PROXY->InstanceTemplate());
     ctx->context.Reset(ISOLATE, c);
-    Handle<Object> glproxy = c->Global();
     Handle<Object> gl = c->Global()->GetPrototype()->ToObject();
     gl->SetAlignedPointerInInternalField(0, (void*)ctx);
     ctx->object.Reset(ISOLATE, gl); // Intercept.
@@ -1079,6 +1066,7 @@ lv8_context *lv8_sandbox_factory(lua_State *L, int idx)
     lua_pushlightuserdata(L, ctx);
     lua_pushvalue(L, idx);
     lua_rawset(L, UV_REFTAB); // Link original table.
+    return ctx;
 }
 
 /* Construct new JS sandbox. */

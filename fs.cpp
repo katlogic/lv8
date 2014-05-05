@@ -156,7 +156,6 @@ static void do_errno(const v8::FunctionCallbackInfo<Value> &info,
   static void fs_##n(const v8::FunctionCallbackInfo<Value> &info) { \
     Isolate *i = ISOLATE; \
     HandleScope scope(i); \
-    Local<Object> self = info.This()->ToObject(); \
     FS_BEFORE \
     ret = n(args); \
     if (ret < 0) \
@@ -203,7 +202,8 @@ FS(lseek, AINT(0), ALONG(1), AINT(2))
 /* Readlink and stat stores result in this (and return integer). */
 #undef FS_BEFORE
 #undef FS_AFTER
-#define FS_BEFORE char buf[PATH_MAX+1]; ssize_t ret;
+#define FS_BEFORE char buf[PATH_MAX+1]; ssize_t ret; \
+    Local<Object> self = info.This()->ToObject();
 #define FS_AFTER self->Set(NEWSTR("readlink_buf"), \
     NEWSTR(buf,String::kNormalString,(int)ret));
 FS(readlink, ASTR(0), buf, PATH_MAX)
@@ -215,7 +215,8 @@ FS(readlink, ASTR(0), buf, PATH_MAX)
     N(atime)N(mtime)N(ctime)
 #define ASSIGN_STAT(n) \
   stat_buf->Set(Int32::New(i, counter++), Number::New(i, ((double)st.st_##n)));
-#define FS_BEFORE struct stat st; int ret; uint32_t counter = 0;
+#define FS_BEFORE struct stat st; int ret; uint32_t counter = 0; \
+    Local<Object> self = info.This()->ToObject();
 #define FS_AFTER Local<Array> stat_buf = Array::New(i, 14); \
   ST_FIELDS(ASSIGN_STAT) \
   self->Set(NEWSTR("stat_buf"), stat_buf);
@@ -227,7 +228,6 @@ FS(fstat, AINT(0), &st)
 static void fs_realpath(const v8::FunctionCallbackInfo<Value> &info) {
   Isolate *i = ISOLATE;
   HandleScope scope(i);
-  Local<Object> self = info.This()->ToObject();
   char buf[PATH_MAX+1];
   char *ret = realpath(ASTR(0), buf);
   if (!ret) {
@@ -242,8 +242,6 @@ static void fs_realpath(const v8::FunctionCallbackInfo<Value> &info) {
 static void fs_readdir(const v8::FunctionCallbackInfo<Value> &info) {
   Isolate *i = ISOLATE;
   HandleScope scope(i);
-  Local<Object> self = info.This()->ToObject();
-  char buf[PATH_MAX+1];
   DIR *d = opendir(ASTR(0));
   if (!d) {
     do_errno(info, "readdir");

@@ -53,7 +53,7 @@ struct lv8_context : lv8_object {
   unsigned resurrected:1;
 };
 
-/* Public C++ API */
+/* Public C++ API, see lv8.cpp for usage. */
 v8::Local<v8::ObjectTemplate> lv8_fs_init();
 void lv8_wrap_js2lua(lua_State *L, v8::Handle<v8::Object> o);
 lv8_context *lv8_unwrap_lua(lua_State *L, int idx, int *type = 0);
