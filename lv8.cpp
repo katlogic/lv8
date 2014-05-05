@@ -822,7 +822,7 @@ Handle<ObjectTemplate> static lv8_vm_init(lua_State *L)
   return scope.Escape(vm);
 }
 
-/* Initialize global state. Must be in context. */
+/* Initialize global state. */
 static void checkstate(lua_State *L)
 {
   lv8_state *state = LV8_STATE;
@@ -852,6 +852,8 @@ static void checkstate(lua_State *L)
       External::New(ISOLATE, L));
   tpl->SetCallAsFunctionHandler(lv8_js2lua_call, External::New(ISOLATE, L));
 
+  /* We might not have proper context, but
+   * the following code needs it. */
   Handle<Context> tmp = Context::New(ISOLATE);
   tmp->Enter();
 #if LV8_FS_API
@@ -905,7 +907,6 @@ int lv8_create_instance(lua_State *L)
 
   int caught = 0;
 
-  HandleScope scope(ISOLATE);
   {
     CB_LUA_COMMON; // Enter context.
     int argc = lua_gettop(L)-1;
