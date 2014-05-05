@@ -975,13 +975,12 @@ bool lv8_shallow_copy(lua_State *L, Handle<Object> dst, Handle<Object> o)
 }
 
 /* Check if given object at idx is wrapped (context, js object etc). */
-lv8_context *lv8_unwrap_lua(lua_State *L, int idx, int *type)
+struct lv8_context *lv8_unwrap_lua(lua_State *L, int idx)
 {
   if (lua_getmetatable(L, idx)) {
     if (lua_rawequal(L, -1, UV_OBJMT)) {
       lua_pop(L, 1);
       lv8_context *p = (lv8_context*)lua_touserdata(L, idx);
-      if (type) *type = p->type;
       return p;
     }
     lua_pop(L, 1);
@@ -1009,7 +1008,7 @@ bool lv8_shallow_copy_from_lua(lua_State *L, Handle<Object> dst, int idx)
 }
 
 /* Context factory common to Lua and JS callers. */
-lv8_context *lv8_context_factory(struct lua_State *L)
+struct lv8_context *lv8_context_factory(struct lua_State *L)
 {
   checkstate(L);
   HandleScope scope(ISOLATE);
@@ -1045,7 +1044,7 @@ int lv8_create_context(struct lua_State *L)
 }
 
 /* Common sandbox factory for JS and Lua. */
-lv8_context *lv8_sandbox_factory(lua_State *L, int idx)
+struct lv8_context *lv8_sandbox_factory(lua_State *L, int idx)
 {
     if (idx < 0) // Convert to absolute index.
       idx += lua_gettop(L) + 1;
