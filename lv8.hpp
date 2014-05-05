@@ -28,7 +28,15 @@ extern "C" {
 #include "lv8.h"
 }
 
+enum {
+  LV8_OBJ_LUA,
+  LV8_OBJ_JS,
+  LV8_OBJ_CTX,
+  LV8_OBJ_SB
+};
+
 struct lv8_object {
+  int type;
   v8::Persistent<v8::Object> object;
 };
 
@@ -48,7 +56,10 @@ struct lv8_context : lv8_object {
 /* Public C++ API */
 v8::Local<v8::ObjectTemplate> lv8_fs_init();
 void lv8_wrap_js2lua(lua_State *L, v8::Handle<v8::Object> o);
-lv8_context *lv8_unwrap(lua_State *L, int idx);
+lv8_context *lv8_unwrap_lua(lua_State *L, int idx, int *type = 0);
 bool lv8_shallow_copy(lua_State *L, v8::Handle<v8::Object> dst, v8::Handle<v8::Object> o);
 bool lv8_shallow_copy_from_lua(lua_State *L, v8::Handle<v8::Object> dst, int idx);
+bool lv8_is_lua_object(lua_State *L, v8::Handle<v8::Object> o);
+bool lv8_is_js_sandbox(lua_State *L, v8::Handle<v8::Object> o, lv8_context **cp);
+bool lv8_is_js_context(v8::Handle<v8::Object> o);
 
