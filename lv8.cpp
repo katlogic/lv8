@@ -33,10 +33,11 @@
 #define LV8_CPP
 #include "lv8.hpp"
 
+#include "macros.hpp"
+
 using namespace v8;
 
 /* lua_pushuserdata(). */
-#define LV8_IDENTITY "lv8::identity"
 #define LV8_NEED_FINHACK ((LUA_VERSION_NUM<503) && !defined(LUA_VERSION_LJX))
 #ifndef lua_pushuserdata
 #include "pudata/pudata.h"
@@ -47,6 +48,7 @@ using namespace v8;
 
 /* Default V8 engine flags. */
 #define LV8_DEFAULT_FLAGS "--harmony"
+#define LV8_IDENTITY "lv8::identity"
 
 /* Shortcut accessors. */
 #define UV_LIB lua_upvalueindex(1) // ORDER luaopen_lv8.
@@ -55,27 +57,10 @@ using namespace v8;
 #define UV_OBJMT lua_upvalueindex(4)
 #define UV_CTXMT lua_upvalueindex(5)
 #define LV8_STATE ((lv8_state*)lua_touserdata(L, UV_STATE))
-#define ISOLATE Isolate::GetCurrent()
-#define UNWRAP_L \
-  lua_State *L = (lua_State*)External::Cast(*info.Data())->Value()
 
-
-/* Shortcut constructors. */
+/* Shortcut template accessors. */
 #define PROXY Local<FunctionTemplate>::New(ISOLATE, LV8_STATE->proxy)
 #define GLOBAL Local<ObjectTemplate>::New(ISOLATE, LV8_STATE->gtpl)
-#define LOCAL(v) Local<Value>::New(ISOLATE, (v))
-#define OREF(v) Local<Object>::New(ISOLATE, (v->object))
-#define CREF(v) Local<Context>::New(ISOLATE, (v->context))
-#define REF(t,v) Handle<t>::New(ISOLATE, (v))
-#define ESCAPE(v) scope.Escape(LOCAL(v));
-#define UTF8(arg...) String::NewFromUtf8(ISOLATE, arg)
-#define LITERAL(s) \
-  String::NewFromUtf8(ISOLATE, s, String::kInternalizedString, sizeof(s)-1)
-#define JS_DEFUN(tab, name, fn, data) \
-  tab->Set(LITERAL(name), \
-      FunctionTemplate::New(ISOLATE, fn, External::New(ISOLATE, data)))
-#define THROW(s) \
-  ISOLATE->ThrowException(Exception::Error(UTF8(s)));
 
 /*
  * Notes on how GC works:
@@ -169,7 +154,7 @@ js_weak_context(const WeakCallbackData<Context, lua_State> &data)
   lv8_context *v = (lv8_context*)o->GetAlignedPointerFromInternalField(0);
   lua_State *L = data.GetParameter();
 
-  lua_pushuserdata(L, v); // Remove anchor if there is one.
+  lv8_push(L, v);// Remove anchor if there is one.
   lua_pushnil(L);
   lua_rawset(L, UV_REFTAB);
 
@@ -310,14 +295,14 @@ static void convert_js2lua(lua_State *L, const Handle<Value> &v,
         return; // Return native Lua object.
       }
       assert(c->type == LV8_OBJ_SB);
-      lua_pushuserdata(L, c);
+      lv8_push(L, c);
     } else { // (UNLIKELY) Not proxied, might be context or JS value.
       if (!lv8_is_js_context(o)) {
         lv8_wrap_js2lua(L, o);
         return; // Return JS object proxy (new or cached).
       } // Otherwise it is a context.
       c = (lv8_context*)o->GetAlignedPointerFromInternalField(0);
-      lua_pushuserdata(L, c);
+      lv8_push(L, c);
     }
     /* INVARIANT #3 */
     assert(!c->jscollected); // Must not be past weak_context.
@@ -746,71 +731,6 @@ class ab_allocator : public ArrayBuffer::Allocator {
   }
 };
 
-/* Eval a string (with explicit context or default one). */
-static void js_vm_eval(const v8::FunctionCallbackInfo<Value> &info) {
-  HandleScope scope(ISOLATE);
-  UNWRAP_L;
-  Handle<Value> source = info[0];
-  Handle<Value> file = info[1];
-  Handle<Value> ctx = info[2];
-  Handle<Value> dryrun = info[3];
-
-  Handle<Script> script;
-  Handle<Context> c;
-
-  if (!ctx.IsEmpty() && ctx->IsObject()) // Load context if possible.
-    if (lv8_context *p = lv8_unwrap_js(L, ctx->ToObject(), true))
-      if (p->type == LV8_OBJ_CTX || p->type == LV8_OBJ_SB) {
-        c = CREF(p);
-        c->Enter();
-      }
-
-  if (file.IsEmpty()) {
-    script = Script::Compile(source->ToString());
-  } else {
-    ScriptOrigin origin(file->ToString());
-    script = Script::Compile(source->ToString(), &origin);
-  }
-  if (!(!dryrun.IsEmpty() && dryrun->IsTrue())) {
-    info.GetReturnValue().Set(script->Run());
-  }
-  if (!c.IsEmpty())
-    c->Exit();
-}
-
-/* Construct a JS context. */
-static void js_vm_context(const v8::FunctionCallbackInfo<Value> &info) {
-  UNWRAP_L;
-  lv8_context *c = lv8_context_factory(L);
-  if (!info[0].IsEmpty() && info[0]->IsObject())
-    lv8_shallow_copy(L, OREF(c), info[0]->ToObject());
-  info.GetReturnValue().Set(OREF(c));
-  lua_pop(L, 1);
-}
-
-/* Construct a JS sandbox. */
-static void js_vm_sandbox(const v8::FunctionCallbackInfo<Value> &info) {
-  UNWRAP_L;
-  Handle<Object> o = info[0]->ToObject();
-  if (lv8_object *p = lv8_unwrap_js(L, o)) {
-    lua_pushuserdata(L, p);
-    lv8_context *c = lv8_sandbox_factory(L, -1);
-    info.GetReturnValue().Set(OREF(c));
-    lua_pop(L, 2); // Kept alive by js2lua or finalizer resurrection.
-  }
-}
-
-/* JavaScript raw vm.* API subtable. */
-Handle<ObjectTemplate> static lv8_vm_init(lua_State *L)
-{
-  EscapableHandleScope scope(ISOLATE);
-  Local<ObjectTemplate> vm = ObjectTemplate::New();
-  JS_DEFUN(vm, "eval", js_vm_eval, L); // Execute.
-  JS_DEFUN(vm, "context", js_vm_context, L); // Create context.
-  JS_DEFUN(vm, "sandbox", js_vm_sandbox, L); // Create sandbox.
-  return scope.Escape(vm);
-}
-
 /* Initialize global state. */
 static void checkstate(lua_State *L)
 {
@@ -845,13 +765,11 @@ static void checkstate(lua_State *L)
    * the following code needs it. */
   Handle<Context> tmp = Context::New(ISOLATE);
   tmp->Enter();
-#if LV8_FS_API
-  lv8_wrap_js2lua(L, lv8_fs_init()->NewInstance());
-  lua_setfield(L, UV_LIB, "fs");
-#endif
-  lv8_wrap_js2lua(L, lv8_vm_init(L)->NewInstance());
-  lua_setfield(L, UV_LIB, "vm");
+#if LV8_BINDING
+  lv8_wrap_js2lua(L, lv8_binding_init(L)->NewInstance());
+  lua_setfield(L, UV_LIB, "binding");
   tmp->Exit();
+#endif
 }
 
 /* Wrapper for lv8 table __call. */
@@ -885,6 +803,12 @@ static const struct luaL_Reg lv8_lib[] = {
 };
 
 //////////////////////////////// PUBLIC //////////////////////////////
+
+/* Push lv8_object on Lua stack. */
+void lv8_push(lua_State *L, lv8_object *v)
+{
+  lua_pushuserdata(L, v);
+}
 
 /* Construct object as 'new arg1(arg2...)' */
 int lv8_create_instance(lua_State *L)

@@ -54,11 +54,14 @@ struct lv8_context : lv8_object {
 };
 
 /* Public C++ API, see lv8.cpp for usage. */
-v8::Local<v8::ObjectTemplate> lv8_fs_init();
 void lv8_wrap_js2lua(lua_State *L, v8::Handle<v8::Object> o);
 lv8_context *lv8_unwrap_js(lua_State *L, v8::Handle<v8::Object> o, bool context = false);
 bool lv8_shallow_copy(lua_State *L, v8::Handle<v8::Object> dst, v8::Handle<v8::Object> o);
 bool lv8_shallow_copy_from_lua(lua_State *L, v8::Handle<v8::Object> dst, int idx);
 bool lv8_is_js_sandbox(lua_State *L, v8::Handle<v8::Object> o, lv8_context **cp);
 bool lv8_is_js_context(v8::Handle<v8::Object> o);
+void lv8_push(lua_State *L, lv8_object *v);
+
+/* Binding. */
+v8::Handle<v8::ObjectTemplate> lv8_binding_init(lua_State *L);
 
