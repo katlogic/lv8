@@ -340,7 +340,7 @@ static void js_vm_eval(const v8::FunctionCallbackInfo<Value> &info) {
       exo->Set(UTF8("startPosition"), Int32::New(ISOLATE, msg->GetStartPosition()));
       exo->Set(UTF8("endPosition"), Int32::New(ISOLATE, msg->GetEndPosition()));
       exo->Set(UTF8("startColumn"), Int32::New(ISOLATE, msg->GetStartColumn()));
-      exo->Set(UTF8("endColumn"), Int32::New(ISOLATE, msg->GetStartColumn()));
+      exo->Set(UTF8("endColumn"), Int32::New(ISOLATE, msg->GetEndColumn()));
     }
     tc.ReThrow();
   } else if (!(!dryrun.IsEmpty() && dryrun->IsTrue())) {
