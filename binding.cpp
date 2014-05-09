@@ -321,8 +321,14 @@ static void js_vm_eval(const v8::FunctionCallbackInfo<Value> &info) {
 
   Handle<Context> c;
 
-  lv8_context *p = lv8_unwrap_js(L, ctx->ToObject(), true);
-  assert(p && (p->type == LV8_OBJ_CTX || p->type == LV8_OBJ_SB));
+  lv8_context *p = 0;
+  
+  if (!ctx.IsEmpty() && ctx->IsObject())
+    p = lv8_unwrap_js(L, ctx->ToObject(), true);
+  if (!(p && (p->type == LV8_OBJ_CTX || p->type == LV8_OBJ_SB))) {
+    THROW("Invalid execution context");
+    return;
+  }
 
   c = CREF(p);
   c->Enter();
