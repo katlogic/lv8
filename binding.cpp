@@ -1,5 +1,5 @@
 /*
- * Lua <-> V8 bridge, filesystem module.
+ * Lua <-> V8 bridge, low-level FFI bindings.
  * (C) Copyright 2014, Karel Tuma <kat@lua.cz>, All rights reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -314,32 +314,40 @@ static void binding_readdir(const v8::FunctionCallbackInfo<Value> &info) {
 static void js_vm_eval(const v8::FunctionCallbackInfo<Value> &info) {
   HandleScope scope(ISOLATE);
   UNWRAP_L;
-  Handle<Value> source = info[0];
-  Handle<Value> file = info[1];
-  Handle<Value> ctx = info[2];
+  Handle<Value> ctx = info[0];
+  Handle<Value> source = info[1];
+  Handle<Value> file = info[2];
   Handle<Value> dryrun = info[3];
 
-  Handle<Script> script;
   Handle<Context> c;
 
-  if (!ctx.IsEmpty() && ctx->IsObject()) // Load context if possible.
-    if (lv8_context *p = lv8_unwrap_js(L, ctx->ToObject(), true))
-      if (p->type == LV8_OBJ_CTX || p->type == LV8_OBJ_SB) {
-        c = CREF(p);
-        c->Enter();
-      }
+  lv8_context *p = lv8_unwrap_js(L, ctx->ToObject(), true);
+  assert(p && (p->type == LV8_OBJ_CTX || p->type == LV8_OBJ_SB));
 
-  if (file.IsEmpty()) {
-    script = Script::Compile(source->ToString());
-  } else {
-    ScriptOrigin origin(file->ToString());
-    script = Script::Compile(source->ToString(), &origin);
-  }
-  if (!(!dryrun.IsEmpty() && dryrun->IsTrue())) {
+  c = CREF(p);
+  c->Enter();
+
+  TryCatch tc;
+  Handle<Script> script = Script::New(source->ToString(), file);
+  Handle<Value> ex = tc.Exception();
+  if (!ex.IsEmpty()) { // Caught syntax error, don't execute.
+    Handle<Object> exo = ex->ToObject();
+    Handle<Message> msg = tc.Message();
+    if (!msg.IsEmpty()) { // V8 won't tell by default.
+      exo->Set(UTF8("sourceLine"), msg->GetSourceLine());
+      exo->Set(UTF8("scriptResourceName"), msg->GetScriptResourceName());
+      exo->Set(UTF8("lineNumber"), Int32::New(ISOLATE, msg->GetLineNumber()));
+      exo->Set(UTF8("startPosition"), Int32::New(ISOLATE, msg->GetStartPosition()));
+      exo->Set(UTF8("endPosition"), Int32::New(ISOLATE, msg->GetEndPosition()));
+      exo->Set(UTF8("startColumn"), Int32::New(ISOLATE, msg->GetStartColumn()));
+      exo->Set(UTF8("endColumn"), Int32::New(ISOLATE, msg->GetStartColumn()));
+    }
+    tc.ReThrow();
+  } else if (!(!dryrun.IsEmpty() && dryrun->IsTrue())) {
     info.GetReturnValue().Set(script->Run());
   }
-  if (!c.IsEmpty())
-    c->Exit();
+
+  c->Exit();
 }
 
 /* Construct a JS context. */
