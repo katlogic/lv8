@@ -330,10 +330,16 @@ static void js_vm_eval(const v8::FunctionCallbackInfo<Value> &info) {
   TryCatch tc;
   Handle<Script> script = Script::New(source->ToString(), file);
   Handle<Value> ex = tc.Exception();
-  if (!ex.IsEmpty()) { // Caught syntax error, don't execute.
+
+  if (ex.IsEmpty() && !(!dryrun.IsEmpty() && dryrun->IsTrue())) {
+    info.GetReturnValue().Set(script->Run()); // Execute.
+    ex = tc.Exception();
+  }
+
+  if (!ex.IsEmpty()) { // Caught error.
     Handle<Object> exo = ex->ToObject();
     Handle<Message> msg = tc.Message();
-    if (!msg.IsEmpty()) { // V8 won't tell by default.
+    if (!msg.IsEmpty()) { // V8 does not propagate this into error objects.
       exo->Set(UTF8("sourceLine"), msg->GetSourceLine());
       exo->Set(UTF8("scriptResourceName"), msg->GetScriptResourceName());
       exo->Set(UTF8("lineNumber"), Int32::New(ISOLATE, msg->GetLineNumber()));
@@ -343,8 +349,6 @@ static void js_vm_eval(const v8::FunctionCallbackInfo<Value> &info) {
       exo->Set(UTF8("endColumn"), Int32::New(ISOLATE, msg->GetEndColumn()));
     }
     tc.ReThrow();
-  } else if (!(!dryrun.IsEmpty() && dryrun->IsTrue())) {
-    info.GetReturnValue().Set(script->Run());
   }
 
   c->Exit();
