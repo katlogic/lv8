@@ -101,6 +101,9 @@ static inline void *get_buf(Handle<Object> b, int32_t off)
       + abv->ByteOffset());
 }
 
+/* Unix bindings. */
+#if !NON_POSIX
+
 /* Errno constants. */
 #define DEF_ERR(_) \
   _(EPERM)_(ENOENT)_(ESRCH)_(EINTR)_(EIO)_(ENXIO)_(E2BIG)_(ENOEXEC) \
@@ -306,11 +309,19 @@ static void binding_readdir(const v8::FunctionCallbackInfo<Value> &info) {
   _(getgroups)_(getgid)_(setgid)_(setuid)_(getuid)_(umask) \
   _(getcwd)_(chdir)_(abort)
 
+#else
+/* WIN32 TBD */
+#define DEF_ERR(_)
+#define DEF_CONST(_)
+#define B_IMPLEMENTS(_)
+#endif //!NON_POSIX
+
 #define JS_DEFUN(tab, name, fn, data) \
   tab->Set(LITERAL(name), \
       FunctionTemplate::New(ISOLATE, fn, External::New(ISOLATE, data)))
 
-/* Eval a string (with explicit context or default one). */
+
+/* Eval a string with explicit and filename. */
 static void js_vm_eval(const v8::FunctionCallbackInfo<Value> &info) {
   HandleScope scope(ISOLATE);
   UNWRAP_L;
@@ -334,7 +345,8 @@ static void js_vm_eval(const v8::FunctionCallbackInfo<Value> &info) {
   c->Enter();
 
   TryCatch tc;
-  Handle<Script> script = Script::New(source->ToString(), file);
+  ScriptOrigin orig(file);
+  Handle<Script> script = Script::Compile(source->ToString(), &orig);
   Handle<Value> ex = tc.Exception();
 
   if (ex.IsEmpty() && !(!dryrun.IsEmpty() && dryrun->IsTrue())) {
@@ -342,7 +354,7 @@ static void js_vm_eval(const v8::FunctionCallbackInfo<Value> &info) {
     ex = tc.Exception();
   }
 
-  if (!ex.IsEmpty()) { // Caught error.
+  if (!ex.IsEmpty() || tc.HasCaught()) { // Caught error.
     Handle<Object> exo = ex->ToObject();
     Handle<Message> msg = tc.Message();
     if (!msg.IsEmpty()) { // V8 does not propagate this into error objects.
@@ -408,7 +420,9 @@ Handle<ObjectTemplate> lv8_binding_init(lua_State *L)
   }
   b->Set(LITERAL("env"), env);
 
+#if !NON_POSIX
   b->Set(LITERAL("pid"), Int32::New(ISOLATE, getpid()));
+#endif
 
   b->Set(LITERAL("arch"), LITERAL(
 #if defined(__amd64__) || defined(__x86_64__) || defined(_M_X64) || defined(_M_AMD64)
